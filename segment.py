@@ -3,7 +3,7 @@ from arcpy import env
 from arcpy.sa import *
 
 
-def segment_cone_dem(aprx_path, map_name, service_layer_name, output_folder, lat, lon, radius):
+def segment(aprx_path, map_name, service_layer_name, output_folder, lat, lon, radius):
     """
     Extracts a user-defined radius DEM around the given lat/lon point and saves both
     the raster and polygon boundary files.
@@ -107,3 +107,4 @@ if __name__ == "__main__":
     radius = 4000
 
     segment_cone_dem(aprx_path, map_name, service_layer_name, output_folder, lat, lon, radius)
+
