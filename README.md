@@ -1,4 +1,4 @@
-# Volcanic DEM Analysis (NASA Space Grant)
+# Automated Volcanic Field DEM Analysis (NASA Space Grant Project)
 
 **GitHub Link:** [Volcanic-DEM-Analysis](https://github.com/aschrameck/Volcanic-DEM-Analysis)
 
