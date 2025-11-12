@@ -76,14 +76,6 @@ Volcanic-DEM-Analysis/
 
 ---
 
-## Tools & Packages
-
-* Python: `numpy`, `pandas`, `matplotlib`
-* R: `cluster`, `ggplot2`, `dplyr` (for future analysis)
-* ArcGIS Pro for DEM processing (optional)
-
----
-
 ## License
 
 This project is released under the MIT License.
