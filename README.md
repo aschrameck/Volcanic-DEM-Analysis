@@ -50,10 +50,12 @@ pip install numpy pandas matplotlib
 
 ### Step 3: Running Python Scripts
 
-Currently, the repository contains two Python scripts:
+Currently, the repository contains three Python scripts:
 
 * `segment.py` – Generic DEM segmentation functions.
-* `radial-segment.py` – Functions for radial segmentation and measurement extraction.
+* `radial-segment.py` – (Deprecated) Functions for radial segmentation and measurement extraction based on USGS 3DEP elevation data.
+  ⚠️ Deprecated as of November 2025: USGS 3DEP data now provides only 8-bit shaded imagery rather than true elevation values.
+* 'dem-segment.py' - Updated version of the radial segmentation workflow that interfaces with the USGS TNM Access API to query true elevation values for crater, cone, and clipped DEM extraction.
 
 ### Step 4: Cluster Analysis in R
 
