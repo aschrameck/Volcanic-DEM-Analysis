@@ -1,3 +1,16 @@
+"""
+⚠️ OBSOLETE FUNCTION — DO NOT USE ⚠️
+
+This function is deprecated as of Nov 2025.
+Reason: USGS 3DEP elevation data is now distributed as 8-bit shaded imagery 
+and no longer contains actual elevation values.
+
+Replacement: Use `dem-segment`, which implements the same radial 
+sampling logic but retrieves elevation data via the TNM Access API.
+
+This function is preserved for archival and reference purposes only.
+"""
+
 import arcpy, os, math, numpy, time, traceback
 from arcpy import env
 from arcpy.sa import *
@@ -487,3 +500,4 @@ if __name__ == "__main__":
             print(f"Expected error: {e}")
         except Exception as e:
             print(traceback.format_exc())
+
