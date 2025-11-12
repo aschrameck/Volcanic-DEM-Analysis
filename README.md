@@ -66,7 +66,8 @@ Currently, the repository contains two Python scripts:
 ```
 Volcanic-DEM-Analysis/
 ├── segment.py               # Generic DEM segmentation functions
-├── radial-segment.py        # Radial segmentation for base and crater boundaries
+├── radial-segment.py        # OBSOLETE - Radial segmentation for base and crater boundaries
+├── den-segment.py           # Query TNM Access API for base and crater boundaries and clipped DEM
 ├── data/                    # Sample DEM files
 ├── README.md
 ```
