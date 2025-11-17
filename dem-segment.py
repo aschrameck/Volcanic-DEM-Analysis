@@ -39,6 +39,9 @@ class DiskSpaceError(Exception):
 
 # --- Helper Functions ---
 def save_shapefile(geom, path, crs="EPSG:4326", extra_fields=None):
+    """
+    Save a shapefile with given geometry (shapely object or list of objects).
+    """
     if not isinstance(geom, list):
         geom = [geom]
     gdf = gpd.GeoDataFrame(extra_fields or {}, geometry=geom, crs=crs)
@@ -560,7 +563,7 @@ if __name__ == "__main__":
     dem_folder = r"D:\NASA_Research_Project\Cone_DEMS"
 
     test_cases = [
-            {"lat": 35.3641, "lon": -111.5033},  # Sunset Crater
+            {"lat": 35.3641, "lon": -111.5033, "num": 1},  # Sunset Crater
             {"lat": 0, "lon": 0},                # Ocean (Null Error)
             {"lat": 39.7392, "lon": -104.9903},  # Denver, CO (Cone Error)
         ]
@@ -569,7 +572,7 @@ if __name__ == "__main__":
         print("\n--- Testing coordinates:", case["lat"], case["lon"], "---")
 
         try:
-            dem_segment(case["lat"], case["lon"], 1, polygon_folder, dem_folder, diag=True)
+            dem_segment(case["lat"], case["lon"], case["num"], polygon_folder, dem_folder, diag=True)
 
         except (NullError, DownloadError, ConeError) as e:
             print(f"Expected error: {e}")
