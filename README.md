@@ -16,14 +16,25 @@ Key objectives include:
 
 ---
 
-## Setup Instructions
+## Project Structure
 
-### Prerequisites
+```
+Volcanic-DEM-Analysis/
+|
+├── DEMs/                    # Folder to store DEM downloads
+├── Polygons/                # Folder to store cone and crater polygons
+├── data/                    # Sample segmented DEM files
+├── output/                  # Output folder for metrics and logs
+├── cone-metrics.py          # Computes metrics from cone DEMs
+├── dem-segment.py           # Core DEM segmentation functions
+├── parallel_run.py          # Pipeline with parallelization
+├── radial-segment.py        # OBSOLETE - Radial segmentation for base and crater boundaries
+├── run.py                   # Serial (single-threaded) pipeline
+├── vent_coords.xls          # Example vent coordinate input
+├── README.md
+```
 
-* **Python 3.x** (with `numpy`, `pandas`, `matplotlib` installed)
-* **R** (with `cluster`, `ggplot2`, `dplyr` installed)
-* **ArcGIS Pro** (for ArcPy if using DEM processing within ArcGIS)
-* Optional: IDEs like VSCode, PyCharm, or RStudio for running scripts
+## Set Up
 
 ### Step 1: Clone the Repository
 
@@ -34,28 +45,44 @@ cd Volcanic-DEM-Analysis
 
 ### Step 2: Set Up Python Environment
 
-1. Create a virtual environment (optional but recommended):
+* Create a virtual environment (optional but recommended):
 
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Windows use `venv\Scripts\activate`
 ```
 
-2. Install required Python packages:
+* Ensure Python 3.9+ is installed.
 
+Install required packages:
 ```bash
-pip install numpy pandas matplotlib
-# ArcPy comes with ArcGIS Pro if needed
+pip install pandas tqdm requests rasterio shapely
 ```
 
 ### Step 3: Running Python Scripts
 
-Currently, the repository contains three Python scripts:
+Update paths in run.py or parallel_run.py for:
+* POLYGON_FOLDER
+* DEM_FOLDER
+* VENT_COORD
+* CSV_OUT
 
-* `segment.py` – Generic DEM segmentation functions.
-* `radial-segment.py` – (Deprecated) Functions for radial segmentation and measurement extraction based on USGS 3DEP elevation data.
-  ⚠️ Deprecated as of November 2025: USGS 3DEP data now provides only 8-bit shaded imagery rather than true elevation values.
-* `dem-segment.py` - Updated version of the radial segmentation workflow that interfaces with the USGS TNM Access API to query true elevation values for crater, cone, and clipped DEM extraction.
+#### Serial execution (single-threaded)
+```bash
+python run.py
+```
+* Suitable for small batches or debugging.
+* Generates cone_run.log and cone_failures.csv.
+* Handles Phase 1 and Phase 2 sequentially.
+
+#### Parallel execution
+```bash
+python parallel_run.py
+```
+* Uses multiple processes for faster processing.
+* Supports progress bars for both phases.
+* Automatically resumes from cone_failures.csv if the pipeline is interrupted.
+* Generates updated cone_failures.csv and run log.
 
 ### Step 4: Cluster Analysis in R
 
@@ -63,18 +90,10 @@ Currently, the repository contains three Python scripts:
 
 ---
 
-## Project Structure
+## Logging
 
-```
-Volcanic-DEM-Analysis/
-├── segment.py               # Generic DEM segmentation functions
-├── radial-segment.py        # OBSOLETE - Radial segmentation for base and crater boundaries
-├── den-segment.py           # Query TNM Access API for base and crater boundaries and clipped DEM
-├── data/                    # Sample DEM files
-├── README.md
-```
-
----
+* Run log: cone_run.log — contains detailed information for each cone and retry attempt.
+* Failure log: cone_failures.csv — tracks all cones that failed, with retry counters and timestamps.
 
 ## License
 
