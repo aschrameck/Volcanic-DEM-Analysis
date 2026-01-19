@@ -12,6 +12,9 @@ from shapely.ops import unary_union
 from scipy.stats import skew, kurtosis
 import matplotlib.pyplot as plt
 
+from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpaceError
+import traceback
+
 
 # --- Helper Functions ---
 def run_diagnostics(dem, transform, cone_poly, crater_poly,
@@ -194,7 +197,8 @@ def radial_widths(polygon, centroid):
 
 
 # --- Main Function ---
-def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, output_csv=None, diag=False):
+def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNING, warning_reasons,
+                 output_csv=None, diag=False):
     """
     Calculate morphometric parameters for cone and crater from segmented raster outputs.
 
@@ -224,6 +228,10 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, output
         Path to cone boundary shapefile or feature class.
     crater_boundary : str
         Path to crater boundary shapefile or feature class.
+    WARNING : bool
+        Flag indicating if there were warnings during DEM segmentation.
+    warning_reasons : list of str
+        List of warning reasons from DEM segmentation.
     output_csv : str, optional
         Path to output CSV file or directory.
         Default: None
@@ -233,7 +241,9 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, output
     """
     # --- Set up ---
     start = time.perf_counter()
-    print(f"Starting cone_metrics for cone #{num}: ({lat}, {lon})")
+
+    if diag:
+        print(f"Starting cone_metrics for cone #{num}: ({lat}, {lon})")
 
     lat_str = str(lat).replace('.', '_')
     lon_str = str(lon).replace('.', '_')
@@ -251,7 +261,8 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, output
 
     # --- Reproject polygons to a projected CRS (meters) if DEM is geographic ---
     if dem_crs.is_geographic:  # degrees
-        print("⚠ DEM is geographic (lat/lon). Reprojecting polygons to projected CRS in meters.")
+        if diag:
+            print("⚠ DEM is geographic (lat/lon). Reprojecting polygons to projected CRS in meters.")
 
         # Pick a UTM zone based on the cone center
         utm_zone = int((lon + 180)//6) + 1
@@ -288,6 +299,13 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, output
             res_x=res_x,
             res_y=res_y
         )
+
+    # Initialize warning string
+    warning = ""
+    if WARNING:
+        warning = "WARNING"
+        if warning_reasons:
+            warning += " (" + "; ".join(warning_reasons) + ")"
 
     # Extract elevation values
     cone_elevs = raster_values_within_polygon(cone_dem, cone_poly)
@@ -377,7 +395,7 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, output
 
         if new_file:
             headers = [
-                "Number", "Latitude", "Longitude",
+                "Warnings", "Number", "Latitude", "Longitude",
                 "Cone_Height_Max", "Cone_Elev_Max", "Cone_Elev_Min", "Cone_Elev_Mean",
                 "Cone_Elev_Median", "Cone_Elev_Std", "Cone_Elev_Skew", "Cone_Elev_Kurt",
                 "Cone_Basal_Perimeter", "Cone_Basal_Area",
@@ -400,7 +418,7 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, output
             writer.writerow(headers)
 
         writer.writerow([
-            num, lat, lon,
+            warning, num, lat, lon,
             cone_max_height,
             cone_elev_stats["max"], cone_elev_stats["min"], cone_elev_stats["mean"],
             cone_elev_stats["median"], cone_elev_stats["std"], cone_elev_stats["skew"],
@@ -424,20 +442,53 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, output
             ratios["crater_avg_w_cone_avg_w"], ratios["crater_d_cone_h"]
         ])
 
-    print(f"Runtime: {time.perf_counter() - start:.2f} sec")
-    print(f"Metrics saved to: {csv_path}")
+    if diag:
+        print(f"Runtime: {time.perf_counter() - start:.2f} sec")
+        print(f"Metrics saved to: {csv_path}")
 
     return csv_path
 
 
-# --- Testing ---
 if __name__ == "__main__":
-    lat = 35.3641
-    lon = -111.5033
-    num = 1
-    dem = r"D:\NASA_Research_Project\Tests\Sunset_Crater_DEM_Segment\1_35_3641x-111_5033_clipped.tif"
-    cone = r"D:\NASA_Research_Project\Tests\Sunset_Crater_DEM_Segment\1_35_3641x-111_5033_base.shp"
-    crater = r"D:\NASA_Research_Project\Tests\Sunset_Crater_DEM_Segment\1_35_3641x-111_5033_crater.shp"
-    csv_out = r"D:\NASA_Research_Project\Cone_Metrics"
+    polygon_folder = r"D:\NASA_Research_Project\Cone_Polygons"
+    dem_folder = r"D:\NASA_Research_Project\Cone_DEMS"
+    csv_out = r"D:\NASA_Research_Project\Cone_Metrics\tests.csv"
 
-    cone_metrics(lat, lon, num, dem, cone, crater, output_csv=csv_out, diag=True)
+    print("Starting test cases for cone_metrics...\n")
+
+    test_cases = [
+            {"lat": 35.597220, "lon": -111.610612, "num": 1},  # Crater 01 (very elongated crater, more like a fissure)
+            {"lat": 35.579547, "lon": -111.581650, "num": 2},  # Crater 02 (low elevation rim and open on one side)
+            {"lat": 35.558799, "lon": -111.605790, "num": 3},  # Crater 03 (slightly elongated crater)
+            {"lat": 35.3641, "lon": -111.5033, "num": 4},      # Sunset Crater - GOOD
+            {"lat": 35.582329, "lon": -111.631927, "num": 5},  # SP Crater
+            {"lat": 35.543845, "lon": -111.637273, "num": 6},  # Colton Crater !!! FAILS CONE CHECK !!!
+            {"lat": 0, "lon": 0, "num": 7},                # Ocean (Null Error)
+            {"lat": 39.7392, "lon": -104.9903, "num": 8},  # Denver, CO (Cone Error)
+        ]
+
+    for case in test_cases:
+        print("\n--- Running coordinates:", case["lat"], case["lon"], "---")
+
+        try:
+            dem = dem_segment(case["lat"], case["lon"], case["num"], polygon_folder, dem_folder, diag=False)
+            cone_dem_path, cone_polygon_path, crater_polygon_path, WARNING, warning_reasons = dem
+            cone_metrics(
+                lat=case["lat"],
+                lon=case["lon"],
+                num=case["num"],
+                cone_dem=cone_dem_path,
+                cone_boundary=cone_polygon_path,
+                crater_boundary=crater_polygon_path,
+                WARNING=WARNING,
+                warning_reasons=warning_reasons,
+                output_csv=csv_out,
+                diag=False
+            )
+
+        except (NullError, DownloadError, DiskSpaceError) as e:
+            print(f"Expected error: {e}")
+        except Exception:
+            print(traceback.format_exc())
+
+    print("\nTest cases complete.")
