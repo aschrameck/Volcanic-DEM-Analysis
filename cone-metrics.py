@@ -450,9 +450,9 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
 
 
 if __name__ == "__main__":
-    polygon_folder = r"D:\NASA_Research_Project\Cone_Polygons"
-    dem_folder = r"D:\NASA_Research_Project\Cone_DEMS"
-    csv_out = r"D:\NASA_Research_Project\Cone_Metrics\tests.csv"
+    polygon_folder = r"D:\Cone_Polygons"
+    dem_folder = r"D:\Cone_DEMS"
+    csv_out = r"D:\Metrics.csv"
 
     print("Starting test cases for cone_metrics...\n")
 
