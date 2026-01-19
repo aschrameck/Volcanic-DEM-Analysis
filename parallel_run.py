@@ -28,13 +28,13 @@ from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpac
 from measure import cone_metrics
 
 # --- Configuration ---
-POLYGON_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\Polygons")
-DEM_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\DEMs")
-VENT_COORD = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_vent_coords.xls")
-CSV_OUT = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_metrics.csv")
+POLYGON_FOLDER = Path(r"D:\Polygons")
+DEM_FOLDER = Path(r"D:\DEMs")
+VENT_COORD = Path(r"D:\vent_coords.xls")
+CSV_OUT = Path(r"D:\Metrics.csv")
 
-RUN_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_run.log")
-FAILURE_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_failures.csv")
+RUN_LOG = Path(r"D:\cone_run.log")
+FAILURE_LOG = Path(r"D:\cone_failures.csv")
 
 BASE_RETRY_DELAY = 60       # seconds
 MAX_RETRY_DELAY = 300       # seconds
