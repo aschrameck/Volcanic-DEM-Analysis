@@ -99,12 +99,13 @@ def segment(aprx_path, map_name, service_layer_name, output_folder, lat, lon, ra
 
 # Testing
 if __name__ == "__main__":
-    aprx_path = r"E:\\NASA_Research_Project\ArcGIS_Project\\3DEP_OGC-WCS_Server_Data.aprx"
+    aprx_path = r"E:\3DEP_OGC-WCS_Server_Data.aprx"
     map_name = "2D_3DEP_OGC_Map"
     service_layer_name = "3DEPElevation"
     lat, lon = 35.3641, -111.5033 # Sunset Crater Coordinates
-    output_folder = r"E:\\NASA_Research_Project\\Cone_DEMS"
+    output_folder = r"E:\Cone_DEMS"
     radius = 4000
 
     segment_cone_dem(aprx_path, map_name, service_layer_name, output_folder, lat, lon, radius)
+
 
