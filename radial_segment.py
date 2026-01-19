@@ -475,11 +475,11 @@ def radial_segment(aprx_path, map_name, service_layer_name, polygon_folder, dem_
 
 # --- Testing ---
 if __name__ == "__main__":
-    aprx_path = r"E:\\NASA_Research_Project\ArcGIS_Project\\3DEP_OGC-WCS_Server_Data.aprx"
+    aprx_path = r"E:\3DEP_OGC-WCS_Server_Data.aprx"
     map_name = "2D_3DEP_OGC_Map"
     service_layer_name = "3DEPElevation"
-    polygon_folder = r"E:\\NASA_Research_Project\\Cone_Polygons"
-    dem_folder = r"E:\\NASA_Research_Project\\Cone_DEMS"
+    polygon_folder = r"E:\Cone_Polygons"
+    dem_folder = r"E:\Cone_DEMS"
 
     test_cases = [
             {"lat": 35.3641, "lon": -111.5033, "radius": 4000},  # Sunset Crater
@@ -500,4 +500,5 @@ if __name__ == "__main__":
             print(f"Expected error: {e}")
         except Exception as e:
             print(traceback.format_exc())
+
 
