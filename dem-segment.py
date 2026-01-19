@@ -583,8 +583,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
 # --- Testing ---
 if __name__ == "__main__":
-    polygon_folder = r"D:\NASA_Research_Project\Cone_Polygons"
-    dem_folder = r"D:\NASA_Research_Project\Cone_DEMS"
+    polygon_folder = r"D:\Cone_Polygons"
+    dem_folder = r"D:\Cone_DEMS"
 
     test_cases = [
             {"lat": 35.597220, "lon": -111.610612, "num": 1},  # Crater 01 (very elongated crater, more like a fissure)
@@ -607,3 +607,4 @@ if __name__ == "__main__":
             print(f"Expected error: {e}")
         except Exception:
             print(traceback.format_exc())
+
