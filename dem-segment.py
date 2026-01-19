@@ -7,6 +7,7 @@ import rasterio
 import shutil
 import numpy as np
 import geopandas as gpd
+from scipy.stats import ttest_ind
 from rasterio.merge import merge
 from rasterio.mask import mask
 from pyproj import Transformer
@@ -22,12 +23,6 @@ class NullError(Exception):
 
 class DownloadError(Exception):
     def __init__(self, message="Failed to download DEM from TNM."):
-        self.message = message
-        super().__init__(self.message)
-
-
-class ConeError(Exception):
-    def __init__(self, message="Cone validation failed. Expected: crater > center > base."):
         self.message = message
         super().__init__(self.message)
 
@@ -102,7 +97,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
     lon_str = str(lon).replace('.', '_')
     base_name = f"{num}_{lat_str}x{lon_str}"
 
-    print(f"\nStarting DEM download for cone #{num}: ({lat}, {lon})")
+    if diag:
+        print(f"\nStarting DEM download for cone #{num}: ({lat}, {lon})")
 
     # Constants
     initial_radius = 2000  # 2 km
@@ -116,7 +112,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
     # --- Outer Loop: Expand search area until found ---
     while current_radius <= max_radius and not final_found:
-        print(f"\nAttempting radius {current_radius/1000:.1f} km:")
+        if diag:
+            print(f"\nAttempting radius {current_radius/1000:.1f} km:")
 
         # Compute bounding box
         deg_lat = current_radius / 111_000
@@ -143,9 +140,6 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             try:
                 data = response.json()
             except Exception:
-                print("\n--- RAW RESPONSE FROM TNM ---")
-                print(response.text[:1000])   # let’s inspect first 1k chars
-                print("----------------------------\n")
                 raise DownloadError("TNM did not return JSON.")
         except Exception as e:
             # Delete temporary raster files
@@ -153,7 +147,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                 if raster_path and os.path.exists(raster_path):
                     os.remove(raster_path)
             except Exception as e:
-                print(f"Warning: failed to delete temp raster: {e}")
+                if diag:
+                    print(f"Warning: failed to delete temp raster: {e}")
 
             for fp in all_tiles:
                 try:
@@ -163,11 +158,13 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                     pass
 
             end_time = time.perf_counter()
-            print(f"Function finished in {end_time - start_time:.1f} s")
+            if diag:
+                print(f"Function finished in {end_time - start_time:.1f} s")
             raise DownloadError(f"Failed API query: {e}")
 
         items = data.get("items", [])
-        print(f"TNM metadata returned at radius {current_radius:.1f} km: {len(items)}")
+        if diag:
+            print(f"TNM metadata returned at radius {current_radius:.1f} m: {len(items)}")
 
         if not items:
             current_radius += increment
@@ -194,14 +191,16 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                 # Second request: actual download
                 with requests.get(download_url, stream=True, timeout=120) as resp:
                     resp.raise_for_status()
-                    print(f"Downloading {tile_name} ...")
+                    if diag:
+                        print(f"Downloading {tile_name} ...")
                     with open(tile_path, "wb") as f:
                         for chunk in resp.iter_content(chunk_size=65536):
                             if chunk:
                                 f.write(chunk)
 
                 all_tiles.append(tile_path)
-                print(f"Downloaded: {tile_name}")
+                if diag:
+                    print(f"Downloaded: {tile_name}")
 
             except Exception as e:
                 # Delete temporary raster files
@@ -209,7 +208,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                     if raster_path and os.path.exists(raster_path):
                         os.remove(raster_path)
                 except Exception as e:
-                    print(f"Warning: failed to delete temp raster: {e}")
+                    if diag:
+                        print(f"Warning: failed to delete temp raster: {e}")
 
                 for fp in all_tiles:
                     try:
@@ -219,12 +219,14 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                         pass
 
                 stop_time = time.perf_counter()
-                print(f"Function finished in {stop_time - start_time:.1f} s")
+                if diag:
+                    print(f"Function finished in {stop_time - start_time:.1f} s")
                 raise DiskSpaceError(f"Failed to download tile {tile_name}: {e}")
 
         if not all_tiles:
             stop_time = time.perf_counter()
-            print(f"Function finished in {stop_time - start_time:.1f} s")
+            if diag:
+                print(f"Function finished in {stop_time - start_time:.1f} s")
             raise DownloadError("Failed to download DEM tiles.")
 
         # --- Mosaic tiles together ---
@@ -279,7 +281,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
         if center_elev is None:
             stop_time = time.perf_counter()
-            print(f"Function finished in {stop_time - start_time:.1f} s")
+            if diag:
+                print(f"Function finished in {stop_time - start_time:.1f} s")
             raise NullError("Center elevation missing, invalid DEM.")
 
         # Parameters
@@ -336,7 +339,7 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             rising_count = 0
             flat_count = 0
             slope_points = 3  # consecutive points to confirm slope change
-            slope_change_threshold = 0.2  # m/m change to indicate slope break
+            slope_change_threshold = 0.1  # m/m change to indicate slope break
 
             # Skip any initial descent from crater rim toward center
             while prev_elev > center_elev and r < current_radius:
@@ -363,16 +366,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                     min_elev = elev
                     min_r = r
                     flat_count = 0
-                # Rising
-                elif elev > prev_elev:
-                    rising_count += 1
-                    flat_count = 0
-                    if rising_count >= slope_points:
-                        stop_reason = f"sustained rise detected after {slope_points} points"
-                        edge_found = True
-                        break
                 # Flattening
-                elif abs(elev - prev_elev) < 0.2:
+                elif abs(elev - prev_elev) < 0.25:
                     flat_count += 1
                     if flat_count >= slope_points:
                         stop_reason = f"flat terrain ({flat_count} points within 0.25 m)"
@@ -416,31 +411,40 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                 print(f"Radial {angle_deg:>5.1f}° ended at {min_r:.1f} m ({stop_reason})")
 
         avg_base = np.mean(cone_edge_distances)
-        if edge_found and avg_base < current_radius * 0.95:
-            print(f"Crater/cone edge detected at ~{avg_base:.0f} m radius.")
+        if edge_found and avg_base < current_radius * 0.80:
+            if diag:
+                print(f"Crater/cone edge detected at ~{avg_base:.0f} m radius.")
             final_found = True
         else:
-            print(f"No clear edge found at {current_radius/1000:.1f} km. Expanding search...")
+            if diag:
+                print(f"No clear edge found at {current_radius/1000:.1f} km. Expanding search...")
             current_radius += increment
 
-    # --- If not found after full loop ---
+    # If not found after full loop
     if not final_found:
         end_time = time.perf_counter()
-        print(f"Function finished in {end_time - start_time:.1f} s")
+        if diag:
+            print(f"Function finished in {end_time - start_time:.1f} s")
         raise NullError("Crater/cone edge not found within max radius.")
 
     # --- Create Output ---
-    smoothed_distances = []
-    window = 2
+    cone_smoothed_distances = []
+    crater_smoothed_distances = []
+    cone_window = 5
+    crater_window = 2
     for i in range(radial_steps):
-        neighbors = [cone_edge_distances[(i + j) % radial_steps] for j in range(-window, window + 1)]
-        smoothed_distances.append(sum(neighbors) / len(neighbors))
+        cone_neighbors = [cone_edge_distances[(i + j) % radial_steps] for j in
+                          range(-cone_window, cone_window + 1)]
+        cone_smoothed_distances.append(sum(cone_neighbors) / len(cone_neighbors))
+        crater_neighbors = [crater_rim_distances[(i + j) % radial_steps] for j in
+                            range(-crater_window, crater_window + 1)]
+        crater_smoothed_distances.append(sum(crater_neighbors) / len(crater_neighbors))
 
     # Create crater polygon
     crater_points = []
     crater_elevations = []
     for i, angle_deg in enumerate(radial_angles):
-        r = crater_rim_distances[i]
+        r = crater_smoothed_distances[i]
         angle_rad = math.radians(angle_deg)
         x_deg = lon + (r / 111_000) * math.cos(angle_rad)
         y_deg = lat + (r / 111_000) * math.sin(angle_rad)
@@ -454,7 +458,7 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
     base_points = []
     base_elevations = []
     for i, angle_deg in enumerate(radial_angles):
-        r = smoothed_distances[i]
+        r = cone_smoothed_distances[i]
         angle_rad = math.radians(angle_deg)
         x_deg = lon + (r / 111_000) * math.cos(angle_rad)
         y_deg = lat + (r / 111_000) * math.sin(angle_rad)
@@ -466,38 +470,6 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
     crater_poly = Polygon(crater_points)
     base_poly = Polygon(base_points)
-
-    # --- Cone validation check (rim > center > base) ---
-    center_x, center_y = lon, lat
-    center_elev = get_elevation(center_x, center_y)
-
-    if crater_elevations and base_elevations and center_elev is not None:
-        avg_crater_elev = np.nanmean(crater_elevations)
-        avg_base_elev = np.nanmean(base_elevations)
-
-        if not (avg_crater_elev > center_elev > avg_base_elev):
-            # Delete temporary raster files
-            try:
-                if raster_path and os.path.exists(raster_path):
-                    os.remove(raster_path)
-            except Exception as e:
-                print(f"Warning: failed to delete temp raster: {e}")
-
-            for fp in all_tiles:
-                try:
-                    if os.path.exists(fp):
-                        os.remove(fp)
-                except Exception:
-                    pass
-
-            end_time = time.perf_counter()
-            print(f"Cone validation failed after {end_time - start_time:.3f} seconds")
-            raise ConeError()
-
-    else:
-        raise ValueError(
-            "Cone validation failed: unable to compute crater, base, or center elevations"
-        )
 
     # Save shapefiles
     crater_path = os.path.join(polygon_folder, f"{base_name}_crater.shp")
@@ -526,24 +498,75 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
         with rasterio.open(clipped_dem_path, "w", **out_meta) as dest:
             dest.write(out_image)
 
+        # --- Quality / Consistency Checks ---
+    WARNING = False
+    warning_reasons = []
+
+    # Radial length inconsistency check
+    cone_arr = np.array(cone_edge_distances, dtype=float)
+    cone_arr = cone_arr[~np.isnan(cone_arr)]
+
+    median_radius = np.median(cone_arr)
+
+    # Define "short" radials relative to median
+    short_group = cone_arr[cone_arr < 0.6 * median_radius]
+    long_group = cone_arr[cone_arr >= 0.6 * median_radius]
+
+    # Only test if over a quarter of radials are short
+    if len(short_group) >= 0.25*len(cone_arr):
+        # Welch's t-test
+        t_stat, p_val = ttest_ind(
+            short_group,
+            long_group,
+            equal_var=False,
+            alternative="less"  # test if short_group mean < long_group mean
+            )
+
+        # Flag if difference is statistically significant
+        if p_val < 0.05:
+            WARNING = True
+            warning_reasons.append(
+                f"Radial lengths are inconsistent (Welch t-test p={p_val:.3g})"
+            )
+
+    # Elevation consistency check
+    base_mean_elev = np.nanmean(base_elevations) if base_elevations else None
+    rim_mean_elev = np.nanmean(crater_elevations) if crater_elevations else None
+
+    if base_mean_elev is not None and rim_mean_elev is not None:
+        if not (base_mean_elev < center_elev < rim_mean_elev):
+            WARNING = True
+            warning_reasons.append(
+                "Center elevation not between base and crater rim elevations"
+            )
+
+    # Optional diagnostic info
+    if diag and WARNING:
+        print("WARNING: Cone geometry may be unreliable:")
+        for w in warning_reasons:
+            print("  -", w)
+
     # Delete intermediate tiles
     for tif in all_tiles:
         try:
             os.remove(tif)
         except Exception:
             pass
-    if len(all_tiles) > 1:
-        try:
+    try:
+        if raster_path and os.path.exists(raster_path):
             os.remove(raster_path)
-        except Exception:
-            pass
+            if diag:
+                print("Deleted mosaic:", raster_path)
+    except Exception as e:
+        if diag:
+            print(f"Failed to delete mosaic: {e}")
 
     # Diagnostics
     if diag:
         radials = []
         for i, angle_deg in enumerate(radial_angles):
             a = math.radians(angle_deg)
-            r = smoothed_distances[i]
+            r = cone_edge_distances[i]
             x2 = lon + (r / 111_000) * math.cos(a)
             y2 = lat + (r / 111_000) * math.sin(a)
             radials.append(LineString([(lon, lat), (x2, y2)]))
@@ -551,10 +574,11 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
         save_shapefile(radials, radials_path)
 
     end_time = time.perf_counter()
-    print(f"Function finished in {end_time - start_time:.1f} s")
-    print(f"Final DEM saved: {clipped_dem_path}")
+    if diag:
+        print(f"Function finished in {end_time - start_time:.1f} s")
+        print(f"Final DEM saved: {clipped_dem_path}")
 
-    return clipped_dem_path, base_path, crater_path
+    return clipped_dem_path, base_path, crater_path, WARNING, warning_reasons
 
 
 # --- Testing ---
@@ -563,9 +587,14 @@ if __name__ == "__main__":
     dem_folder = r"D:\NASA_Research_Project\Cone_DEMS"
 
     test_cases = [
-            {"lat": 35.3641, "lon": -111.5033, "num": 1},  # Sunset Crater
-            {"lat": 0, "lon": 0},                # Ocean (Null Error)
-            {"lat": 39.7392, "lon": -104.9903},  # Denver, CO (Cone Error)
+            {"lat": 35.597220, "lon": -111.610612, "num": 1},  # Crater 01 (very elongated crater, more like a fissure)
+            {"lat": 35.579547, "lon": -111.581650, "num": 2},  # Crater 02 (low elevation rim and open on one side)
+            {"lat": 35.558799, "lon": -111.605790, "num": 3},  # Crater 03 (slightly elongated crater)
+            {"lat": 35.3641, "lon": -111.5033, "num": 4},      # Sunset Crater - GOOD
+            {"lat": 35.582329, "lon": -111.631927, "num": 5},  # SP Crater
+            {"lat": 35.543845, "lon": -111.637273, "num": 6},  # Colton Crater
+            {"lat": 0, "lon": 0, "num": 7},                # Ocean (Null Error)
+            {"lat": 39.7392, "lon": -104.9903, "num": 8},  # Denver, CO (Cone Error)
         ]
 
     for case in test_cases:
@@ -574,7 +603,7 @@ if __name__ == "__main__":
         try:
             dem_segment(case["lat"], case["lon"], case["num"], polygon_folder, dem_folder, diag=True)
 
-        except (NullError, DownloadError, ConeError) as e:
+        except (NullError, DownloadError) as e:
             print(f"Expected error: {e}")
         except Exception:
             print(traceback.format_exc())
