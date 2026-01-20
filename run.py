@@ -25,17 +25,17 @@ from measure import cone_metrics
 
 
 # --- Configuration ---
-POLYGON_FOLDER = Path(r"D:\Polygons")
-DEM_FOLDER = Path(r"D:\DEMs")
-VENT_COORD = Path(r"D:\vent_coords.xls")
-CSV_OUT = Path(r"D:\Metrics.csv")
+POLYGON_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\Polygons")
+DEM_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\DEMs")
+VENT_COORD = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_vent_coords.xls")
+CSV_OUT = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_metrics.csv")
 
-RUN_LOG = Path(r"D:\cone_run.log")
-FAILURE_LOG = Path(r"D:\cone_failures.csv")
+RUN_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_run.log")
+FAILURE_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_failures.csv")
 
-BASE_RETRY_DELAY = 60        # seconds
+BASE_RETRY_DELAY = 30        # seconds
 MAX_RETRY_DELAY = 300
-MAX_TOTAL_ATTEMPTS = 5
+MAX_TOTAL_ATTEMPTS = 3      # maximum attempts per cone
 
 TRANSIENT_ERRORS = (DownloadError, Timeout, TimeoutError)
 FATAL_ERRORS = (NullError, DiskSpaceError)
@@ -144,6 +144,7 @@ def process_cone_once(cone: dict) -> dict:
 # --- Phase 1 ---
 def phase_one(cones):
     logger.info("PHASE 1 STARTED")
+    print("PHASE 1 STARTED")
     failures = []
 
     for cone in cones:
@@ -151,17 +152,21 @@ def phase_one(cones):
 
         if res["status"] == "SUCCESS":
             logger.info(f"Cone {res['id']} SUCCESS")
+            print(f"Cone {res['id']} SUCCESS")
         else:
             failures.append(res)
             logger.warning(f"Cone {res['id']} -> {res['status']}")
+            print(f"Cone {res['id']} -> {res['status']}")
 
     logger.info("PHASE 1 COMPLETE")
+    print("PHASE 1 COMPLETE")
     return failures
 
 
 # --- Phase 2 ---
 def phase_two(failures):
     logger.info("PHASE 2 STARTED")
+    print("PHASE 2 STARTED")
     active = failures
 
     while active:
@@ -189,10 +194,12 @@ def phase_two(failures):
                 next_round.append(res)
             else:
                 logger.info(f"Cone {res['id']} RECOVERED")
+                print(f"Cone {res['id']} RECOVERED")
 
         active = next_round
 
     logger.info("PHASE 2 COMPLETE")
+    print("PHASE 2 COMPLETE")
     return active
 
 
