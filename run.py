@@ -19,9 +19,10 @@ import pandas as pd
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from requests.exceptions import Timeout
+from multiprocessing import Manager
 
 from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpaceError
-from measure import cone_metrics
+from measure import cone_metrics, CRS_Error
 
 
 # --- Configuration ---
@@ -33,12 +34,12 @@ CSV_OUT = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_metrics.csv")
 RUN_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_run.log")
 FAILURE_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_failures.csv")
 
-BASE_RETRY_DELAY = 30        # seconds
-MAX_RETRY_DELAY = 300
+BASE_RETRY_DELAY = 30       # seconds
+MAX_RETRY_DELAY = 300       # seconds
 MAX_TOTAL_ATTEMPTS = 3      # maximum attempts per cone
 
 TRANSIENT_ERRORS = (DownloadError, Timeout, TimeoutError)
-FATAL_ERRORS = (NullError, DiskSpaceError)
+FATAL_ERRORS = (NullError, DiskSpaceError, CRS_Error)
 
 
 # Logging setup
@@ -78,7 +79,7 @@ def make_cone_record(id_, lat, lon) -> dict:
 
 
 # --- Worker function ---
-def process_cone_once(cone: dict) -> dict:
+def process_cone_once(cone: dict, lock) -> dict:
     """
     Process a cone exactly once.
     Returns updated cone record.
@@ -108,7 +109,8 @@ def process_cone_once(cone: dict) -> dict:
             WARNING=WARNING,
             warning_reasons=warning_reasons,
             output_csv=CSV_OUT,
-            diag=False
+            diag=False,
+            lock=lock
         )
 
         cone["status"] = "SUCCESS"
@@ -142,13 +144,13 @@ def process_cone_once(cone: dict) -> dict:
 
 
 # --- Phase 1 ---
-def phase_one(cones):
+def phase_one(cones, lock):
     logger.info("PHASE 1 STARTED")
     print("PHASE 1 STARTED")
     failures = []
 
     for cone in cones:
-        res = process_cone_once(cone)
+        res = process_cone_once(cone, lock)
 
         if res["status"] == "SUCCESS":
             logger.info(f"Cone {res['id']} SUCCESS")
@@ -164,7 +166,7 @@ def phase_one(cones):
 
 
 # --- Phase 2 ---
-def phase_two(failures):
+def phase_two(failures, lock):
     logger.info("PHASE 2 STARTED")
     print("PHASE 2 STARTED")
     active = failures
@@ -188,7 +190,7 @@ def phase_two(failures):
                 f"(attempt {cone['attempts'] + 1})"
             )
 
-            res = process_cone_once(cone)
+            res = process_cone_once(cone, lock)
 
             if res["status"] != "SUCCESS":
                 next_round.append(res)
@@ -205,6 +207,9 @@ def phase_two(failures):
 
 # --- Main Execution ---
 if __name__ == "__main__":
+    manager = Manager()
+    METRICS_LOCK = manager.Lock()
+
     start = time.perf_counter()
     print("Starting two-phase cone processing pipeline...")
 
@@ -214,11 +219,11 @@ if __name__ == "__main__":
         for r in df.itertuples()
     ]
 
-    failures = phase_one(cones)
+    failures = phase_one(cones, METRICS_LOCK)
 
     if failures:
         pd.DataFrame(failures).to_csv(FAILURE_LOG, index=False)
-        failures = phase_two(failures)
+        failures = phase_two(failures, METRICS_LOCK)
         pd.DataFrame(failures).to_csv(FAILURE_LOG, index=False)
 
     runtime = time.perf_counter() - start
