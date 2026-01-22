@@ -1,7 +1,6 @@
 import os
 import time
 import csv
-from pyproj import CRS
 import numpy as np
 import geopandas as gpd
 import rasterio
@@ -14,6 +13,14 @@ import matplotlib.pyplot as plt
 
 from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpaceError
 import traceback
+
+
+# --- Custom Exceptions---
+class CRS_Error(Exception):
+    def __init__(self, message="DEM is in a geographic CRS (degrees). "
+                               "Reproject to a projected CRS (meters) before computing metrics."):
+        self.message = message
+        super().__init__(self.message)
 
 
 # --- Helper Functions ---
@@ -126,17 +133,17 @@ def describe_stats(values):
 
 def raster_values_within_polygon(raster_path, polygon):
     """
-    Extracts raster values within a given polygon.
+    Extracts raster values within a given polygon, safely handling nodata.
     """
     with rasterio.open(raster_path) as src:
-        out_image = mask.mask(src, [polygon], crop=True)
+        out_image, _ = mask.mask(src, [polygon], crop=True)
+        data = out_image[0].astype(float)
 
-        data = out_image[0]
         nodata = src.nodata
+        if nodata is not None:
+            data[data == nodata] = np.nan
 
-        valid = data[data != nodata]
-
-        return valid.flatten()
+        return data[np.isfinite(data)]
 
 
 def slope_from_dem(raster_path):
@@ -196,9 +203,91 @@ def radial_widths(polygon, centroid):
     return widths
 
 
+def safe_div(numerator, denominator):
+    """Safely divides two numbers, returning NaN if denominator is zero or NaN."""
+    if denominator is None or np.isnan(denominator) or denominator == 0:
+        return np.nan
+    return numerator / denominator
+
+
+def csv_writing(cone_dem, output_csv, base_name, warning, num, lat, lon,
+                cone_max_height,
+                cone_elev_stats, cone_perimeter, cone_area,
+                cone_width_stats,
+                cone_slope_stats, crater_max_depth,
+                crater_perimeter, crater_area, crater_width_stats,
+                crater_slope_stats, cone_elongation, cone_circularity,
+                cone_eccentricity, crater_elongation, crater_circularity,
+                crater_eccentricity, ratios):
+
+    """Writes metrics to a CSV file."""
+
+    if output_csv is None:
+        output_csv = os.path.dirname(cone_dem)
+    if os.path.isdir(output_csv):
+        csv_path = os.path.join(output_csv, f"{base_name}_metrics.csv")
+    else:
+        csv_path = output_csv
+
+    new_file = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+
+        if new_file:
+            headers = [
+                "Warnings", "Number", "Latitude", "Longitude",
+                "Cone_Height_Max", "Cone_Elev_Max", "Cone_Elev_Min", "Cone_Elev_Mean",
+                "Cone_Elev_Median", "Cone_Elev_Std", "Cone_Elev_Skew", "Cone_Elev_Kurt",
+                "Cone_Basal_Perimeter", "Cone_Basal_Area",
+                "Cone_Width_Max", "Cone_Width_Min", "Cone_Width_Mean", "Cone_Width_Median",
+                "Cone_Width_Std", "Cone_Width_Skew", "Cone_Width_Kurt",
+                "Cone_Slope_Max", "Cone_Slope_Min", "Cone_Slope_Mean", "Cone_Slope_Median",
+                "Cone_Slope_Std", "Cone_Slope_Skew", "Cone_Slope_Kurt",
+                "Crater_Depth_Max", "Crater_Basal_Perimeter", "Crater_Basal_Area",
+                "Crater_Width_Max", "Crater_Width_Min", "Crater_Width_Mean",
+                "Crater_Width_Median", "Crater_Width_Std", "Crater_Width_Skew",
+                "Crater_Width_Kurt", "Crater_Slope_Max", "Crater_Slope_Min",
+                "Crater_Slope_Mean", "Crater_Slope_Median", "Crater_Slope_Std",
+                "Crater_Slope_Skew", "Crater_Slope_Kurt",
+                "Cone_Elongation", "Cone_Circularity", "Cone_Eccentricity",
+                "Crater_Elongation", "Crater_Circularity", "Crater_Eccentricity",
+                "ConeHeight/ConeAvgWidth", "ConeHeight/ConeMaxWidth",
+                "CraterDepth/CraterAvgWidth", "ConeHeight/CraterAvgWidth",
+                "CraterAvgWidth/ConeAvgWidth", "CraterDepth/ConeHeight"
+            ]
+            writer.writerow(headers)
+
+        writer.writerow([
+            warning, num, lat, lon,
+            cone_max_height,
+            cone_elev_stats["max"], cone_elev_stats["min"], cone_elev_stats["mean"],
+            cone_elev_stats["median"], cone_elev_stats["std"], cone_elev_stats["skew"],
+            cone_elev_stats["kurtosis"], cone_perimeter, cone_area,
+            cone_width_stats["max"], cone_width_stats["min"], cone_width_stats["mean"],
+            cone_width_stats["median"], cone_width_stats["std"], cone_width_stats["skew"],
+            cone_width_stats["kurtosis"], cone_slope_stats["max"], cone_slope_stats["min"],
+            cone_slope_stats["mean"], cone_slope_stats["median"], cone_slope_stats["std"],
+            cone_slope_stats["skew"], cone_slope_stats["kurtosis"], crater_max_depth,
+            crater_perimeter, crater_area, crater_width_stats["max"],
+            crater_width_stats["min"], crater_width_stats["mean"],
+            crater_width_stats["median"], crater_width_stats["std"],
+            crater_width_stats["skew"], crater_width_stats["kurtosis"],
+            crater_slope_stats["max"], crater_slope_stats["min"],
+            crater_slope_stats["mean"], crater_slope_stats["median"],
+            crater_slope_stats["std"], crater_slope_stats["skew"],
+            crater_slope_stats["kurtosis"], cone_elongation, cone_circularity,
+            cone_eccentricity, crater_elongation, crater_circularity,
+            crater_eccentricity, ratios["cone_h_avg_w"], ratios["cone_h_max_w"],
+            ratios["crater_d_avg_w"], ratios["cone_h_crater_avg_w"],
+            ratios["crater_avg_w_cone_avg_w"], ratios["crater_d_cone_h"]
+        ])
+
+    return csv_path
+
+
 # --- Main Function ---
 def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNING, warning_reasons,
-                 output_csv=None, diag=False):
+                 output_csv=None, diag=False, lock=None):
     """
     Calculate morphometric parameters for cone and crater from segmented raster outputs.
 
@@ -238,6 +327,9 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
     diag : bool, optional
         If True, runs diagnostic checks and visualizations.
         Default: False
+    lock : multiprocessing.Lock, optional
+        Lock for synchronizing CSV writing in parallel processing.
+        Default: None
     """
     # --- Set up ---
     start = time.perf_counter()
@@ -260,20 +352,14 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
     crater_gdf = gpd.read_file(crater_boundary)
 
     # --- Reproject polygons to a projected CRS (meters) if DEM is geographic ---
-    if dem_crs.is_geographic:  # degrees
+    if dem_crs is None or dem_crs.is_geographic:  # degrees
         if diag:
             print("⚠ DEM is geographic (lat/lon). Reprojecting polygons to projected CRS in meters.")
 
-        # Pick a UTM zone based on the cone center
-        utm_zone = int((lon + 180)//6) + 1
-        utm_crs = CRS.from_proj4(f"+proj=utm +zone={utm_zone} +datum=WGS84 +units=m +no_defs")
-
-        cone_gdf = cone_gdf.to_crs(utm_crs)
-        crater_gdf = crater_gdf.to_crs(utm_crs)
-
-        # Update transform: approximate pixel size in meters
-        res_x = res_y = 1  # placeholder; real DEM in degrees → better to reproject DEM too if precise
-        dem_crs = utm_crs
+        raise CRS_Error(
+            f"DEM for cone #{num} is in a geographic CRS (degrees). "
+            "Reproject DEM to a projected CRS (meters) before computing metrics."
+            )
 
     # --- Ensure DEM and polygons CRS match ---
     if cone_gdf.crs != dem_crs:
@@ -361,86 +447,50 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
 
     # Calculated metrics
     pi = np.pi
-    cone_circularity = (4 * pi * cone_area) / (cone_perimeter ** 2)
-    crater_circularity = (4 * pi * crater_area) / (crater_perimeter ** 2)
-    cone_elongation = cone_area / (pi * (cone_width_stats["max"] / 2) ** 2)
-    crater_elongation = crater_area / (pi * (crater_width_stats["max"] / 2) ** 2)
-    cone_eccentricity = np.sqrt(1 - ((cone_width_stats["min"] ** 2) / (cone_width_stats["max"] ** 2)))
-    crater_eccentricity = np.sqrt(1 - ((crater_width_stats["min"] ** 2) / (crater_width_stats["max"] ** 2)))
+    cone_circularity = safe_div(4 * pi * cone_area, (cone_perimeter ** 2))
+    crater_circularity = safe_div(4 * pi * crater_area, (crater_perimeter ** 2))
+    cone_elongation = safe_div(cone_area, (pi * (cone_width_stats["max"] / 2) ** 2))
+    crater_elongation = safe_div(crater_area, (pi * (crater_width_stats["max"] / 2) ** 2))
+    cone_eccentricity = np.sqrt(1 - (safe_div(cone_width_stats["min"] ** 2, cone_width_stats["max"] ** 2)))
+    crater_eccentricity = np.sqrt(1 - (safe_div(crater_width_stats["min"] ** 2, crater_width_stats["max"] ** 2)))
 
     # Ratios
     cone_avg_width = cone_width_stats["mean"]
     crater_avg_width = crater_width_stats["mean"]
     ratios = dict(
-        cone_h_avg_w=cone_max_height / cone_avg_width,
-        cone_h_max_w=cone_max_height / cone_width_stats["max"],
-        crater_d_avg_w=crater_max_depth / crater_avg_width,
-        cone_h_crater_avg_w=cone_max_height / crater_avg_width,
-        crater_avg_w_cone_avg_w=crater_avg_width / cone_avg_width,
-        crater_d_cone_h=crater_max_depth / cone_max_height
+        cone_h_avg_w=safe_div(cone_max_height, cone_avg_width),
+        cone_h_max_w=safe_div(cone_max_height, cone_width_stats["max"]),
+        crater_d_avg_w=safe_div(crater_max_depth, crater_avg_width),
+        cone_h_crater_avg_w=safe_div(cone_max_height, crater_avg_width),
+        crater_avg_w_cone_avg_w=safe_div(crater_avg_width, cone_avg_width),
+        crater_d_cone_h=safe_div(crater_max_depth, cone_max_height)
     )
 
-    # --- CSV writing ---
-
-    if output_csv is None:
-        output_csv = os.path.dirname(cone_dem)
-    if os.path.isdir(output_csv):
-        csv_path = os.path.join(output_csv, f"{base_name}_metrics.csv")
+    if lock:
+        with lock:
+            csv_path = csv_writing(
+                cone_dem, output_csv, base_name, warning, num, lat, lon,
+                cone_max_height,
+                cone_elev_stats, cone_perimeter, cone_area,
+                cone_width_stats,
+                cone_slope_stats, crater_max_depth,
+                crater_perimeter, crater_area, crater_width_stats,
+                crater_slope_stats, cone_elongation, cone_circularity,
+                cone_eccentricity, crater_elongation, crater_circularity,
+                crater_eccentricity, ratios
+            )
     else:
-        csv_path = output_csv
-
-    new_file = not os.path.exists(csv_path)
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.writer(f)
-
-        if new_file:
-            headers = [
-                "Warnings", "Number", "Latitude", "Longitude",
-                "Cone_Height_Max", "Cone_Elev_Max", "Cone_Elev_Min", "Cone_Elev_Mean",
-                "Cone_Elev_Median", "Cone_Elev_Std", "Cone_Elev_Skew", "Cone_Elev_Kurt",
-                "Cone_Basal_Perimeter", "Cone_Basal_Area",
-                "Cone_Width_Max", "Cone_Width_Min", "Cone_Width_Mean", "Cone_Width_Median",
-                "Cone_Width_Std", "Cone_Width_Skew", "Cone_Width_Kurt",
-                "Cone_Slope_Max", "Cone_Slope_Min", "Cone_Slope_Mean", "Cone_Slope_Median",
-                "Cone_Slope_Std", "Cone_Slope_Skew", "Cone_Slope_Kurt",
-                "Crater_Depth_Max", "Crater_Basal_Perimeter", "Crater_Basal_Area",
-                "Crater_Width_Max", "Crater_Width_Min", "Crater_Width_Mean",
-                "Crater_Width_Median", "Crater_Width_Std", "Crater_Width_Skew",
-                "Crater_Width_Kurt", "Crater_Slope_Max", "Crater_Slope_Min",
-                "Crater_Slope_Mean", "Crater_Slope_Median", "Crater_Slope_Std",
-                "Crater_Slope_Skew", "Crater_Slope_Kurt",
-                "Cone_Elongation", "Cone_Circularity", "Cone_Eccentricity",
-                "Crater_Elongation", "Crater_Circularity", "Crater_Eccentricity",
-                "ConeHeight/ConeAvgWidth", "ConeHeight/ConeMaxWidth",
-                "CraterDepth/CraterAvgWidth", "ConeHeight/CraterAvgWidth",
-                "CraterAvgWidth/ConeAvgWidth", "CraterDepth/ConeHeight"
-            ]
-            writer.writerow(headers)
-
-        writer.writerow([
-            warning, num, lat, lon,
+        csv_path = csv_writing(
+            cone_dem, output_csv, base_name, warning, num, lat, lon,
             cone_max_height,
-            cone_elev_stats["max"], cone_elev_stats["min"], cone_elev_stats["mean"],
-            cone_elev_stats["median"], cone_elev_stats["std"], cone_elev_stats["skew"],
-            cone_elev_stats["kurtosis"], cone_perimeter, cone_area,
-            cone_width_stats["max"], cone_width_stats["min"], cone_width_stats["mean"],
-            cone_width_stats["median"], cone_width_stats["std"], cone_width_stats["skew"],
-            cone_width_stats["kurtosis"], cone_slope_stats["max"], cone_slope_stats["min"],
-            cone_slope_stats["mean"], cone_slope_stats["median"], cone_slope_stats["std"],
-            cone_slope_stats["skew"], cone_slope_stats["kurtosis"], crater_max_depth,
-            crater_perimeter, crater_area, crater_width_stats["max"],
-            crater_width_stats["min"], crater_width_stats["mean"],
-            crater_width_stats["median"], crater_width_stats["std"],
-            crater_width_stats["skew"], crater_width_stats["kurtosis"],
-            crater_slope_stats["max"], crater_slope_stats["min"],
-            crater_slope_stats["mean"], crater_slope_stats["median"],
-            crater_slope_stats["std"], crater_slope_stats["skew"],
-            crater_slope_stats["kurtosis"], cone_elongation, cone_circularity,
+            cone_elev_stats, cone_perimeter, cone_area,
+            cone_width_stats,
+            cone_slope_stats, crater_max_depth,
+            crater_perimeter, crater_area, crater_width_stats,
+            crater_slope_stats, cone_elongation, cone_circularity,
             cone_eccentricity, crater_elongation, crater_circularity,
-            crater_eccentricity, ratios["cone_h_avg_w"], ratios["cone_h_max_w"],
-            ratios["crater_d_avg_w"], ratios["cone_h_crater_avg_w"],
-            ratios["crater_avg_w_cone_avg_w"], ratios["crater_d_cone_h"]
-        ])
+            crater_eccentricity, ratios
+        )
 
     if diag:
         print(f"Runtime: {time.perf_counter() - start:.2f} sec")
@@ -452,7 +502,7 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
 if __name__ == "__main__":
     polygon_folder = r"D:\Cone_Polygons"
     dem_folder = r"D:\Cone_DEMS"
-    csv_out = r"D:\Metrics.csv"
+    csv_out = r"D:\tests.csv"
 
     print("Starting test cases for cone_metrics...\n")
 
