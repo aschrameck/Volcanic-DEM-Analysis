@@ -21,30 +21,31 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from requests.exceptions import Timeout
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import Manager
 from tqdm import tqdm
 import os
 
 from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpaceError
-from measure import cone_metrics
+from measure import cone_metrics, CRS_Error
 
 # --- Configuration ---
 POLYGON_FOLDER = Path(r"D:\Polygons")
 DEM_FOLDER = Path(r"D:\DEMs")
 VENT_COORD = Path(r"D:\vent_coords.xls")
-CSV_OUT = Path(r"D:\Metrics.csv")
+CSV_OUT = Path(r"D:\metrics.csv")
 
 RUN_LOG = Path(r"D:\cone_run.log")
 FAILURE_LOG = Path(r"D:\cone_failures.csv")
 
-BASE_RETRY_DELAY = 60       # seconds
+BASE_RETRY_DELAY = 30       # seconds
 MAX_RETRY_DELAY = 300       # seconds
-MAX_TOTAL_ATTEMPTS = 5      # maximum attempts per cone
+MAX_TOTAL_ATTEMPTS = 3      # maximum attempts per cone
 
 MAX_WORKERS = max(1, os.cpu_count() - 3)  # leave 3 CPUs free
 
 # Error classification
 TRANSIENT_ERRORS = (DownloadError, Timeout, TimeoutError)
-FATAL_ERRORS = (NullError, DiskSpaceError)
+FATAL_ERRORS = (NullError, DiskSpaceError, CRS_Error)
 
 # --- Logging ---
 logging.basicConfig(
@@ -90,15 +91,12 @@ def load_or_create_cones() -> list:
     if not required.issubset(df.columns):
         raise ValueError(f"Excel must contain columns: {required}")
 
-    # Create canonical cone records
     cones = [make_cone_record(r.ID, r.Latitude, r.Longitude) for r in df.itertuples()]
 
-    # If failure CSV exists, update cones with previous state
+    # Merge previous failures
     if FAILURE_LOG.exists():
         old_failures = pd.read_csv(FAILURE_LOG)
         old_dict = {row["id"]: row for idx, row in old_failures.iterrows()}
-
-        # Update existing cones with saved state
         for cone in cones:
             if cone["id"] in old_dict:
                 saved = old_dict[cone["id"]]
@@ -111,29 +109,23 @@ def load_or_create_cones() -> list:
                     "last_attempt": saved.get("last_attempt"),
                     "next_retry_after": saved.get("next_retry_after")
                 })
-
     return cones
 
 
 # --- Worker Function ---
-def process_cone_once(cone: dict) -> dict:
-    """
-    Process a single cone once.
-    Returns updated cone record.
-    """
+def process_cone_once(cone: dict, lock) -> dict:
+    """Process a single cone once and safely write metrics with lock."""
     cone = cone.copy()
     cone["attempts"] += 1
     cone["last_attempt"] = utc_now()
 
     try:
-        # Run DEM segmentation
         dem = dem_segment(
             cone["lat"], cone["lon"], cone["id"],
             POLYGON_FOLDER, DEM_FOLDER, diag=False
         )
         cone_dem, cone_poly, crater_poly, WARNING, warning_reasons = dem
 
-        # Compute metrics
         cone_metrics(
             lat=cone["lat"],
             lon=cone["lon"],
@@ -144,7 +136,8 @@ def process_cone_once(cone: dict) -> dict:
             WARNING=WARNING,
             warning_reasons=warning_reasons,
             output_csv=CSV_OUT,
-            diag=False
+            diag=False,
+            lock=lock
         )
 
         cone["status"] = "SUCCESS"
@@ -169,7 +162,6 @@ def process_cone_once(cone: dict) -> dict:
         cone["error_msg"] = str(e)
         cone["traceback"] = traceback.format_exc()
 
-    # Set next retry time using exponential backoff
     cone["next_retry_after"] = (
         datetime.now(timezone.utc) + timedelta(seconds=compute_backoff(cone["attempts"]))
     ).isoformat()
@@ -177,28 +169,30 @@ def process_cone_once(cone: dict) -> dict:
 
 
 # --- Phase 1 ---
-def phase_one_parallel(cones):
+def phase_one_parallel(cones, lock):
     """Process new cones in parallel."""
     logger.info("PHASE 1 STARTED")
     failures = []
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_map = {executor.submit(process_cone_once, c): c["id"] for c in cones}
-
+        future_map = {executor.submit(process_cone_once, c, lock): c["id"] for c in cones}
         for future in tqdm(as_completed(future_map), total=len(future_map), desc="Phase 1"):
-            res = future.result()
-            if res["status"] == "SUCCESS":
-                logger.info(f"Cone {res['id']} SUCCESS")
-            else:
-                failures.append(res)
-                logger.warning(f"Cone {res['id']} -> {res['status']} ({res['error_type']})")
+            try:
+                res = future.result()
+                if res["status"] == "SUCCESS":
+                    logger.info(f"Cone {res['id']} SUCCESS")
+                else:
+                    failures.append(res)
+                    logger.warning(f"Cone {res['id']} -> {res['status']} ({res['error_type']})")
+            except Exception as e:
+                logger.error(f"Worker crash: {e}")
 
     logger.info("PHASE 1 COMPLETE")
     return failures
 
 
 # --- Phase 2 ---
-def phase_two_parallel(failures):
+def phase_two_parallel(failures, lock):
     """Retry transient failures in parallel until exhausted."""
     logger.info("PHASE 2 STARTED")
     active = failures
@@ -206,7 +200,6 @@ def phase_two_parallel(failures):
     while active:
         now = datetime.now(timezone.utc)
 
-        # Select cones eligible for retry
         retry_batch = [
             c for c in active
             if c["status"] == "RETRY_LATER"
@@ -214,25 +207,38 @@ def phase_two_parallel(failures):
             and datetime.fromisoformat(c["next_retry_after"]) <= now
         ]
 
-        # Cones that are still waiting or exhausted
         pending = [c for c in active if c not in retry_batch]
 
         if not retry_batch:
-            break
+            # Wait until the earliest next retry
+            future_times = [
+                datetime.fromisoformat(c["next_retry_after"])
+                for c in active if c["status"] == "RETRY_LATER"
+            ]
+            if future_times:
+                sleep_time = max(0, (min(future_times) - now).total_seconds())
+                logger.info(f"Sleeping {sleep_time:.1f}s until next retry")
+                time.sleep(sleep_time)
+            else:
+                break
+            continue
 
         logger.info(f"Retrying {len(retry_batch)} cones")
 
         next_round = []
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_map = {executor.submit(process_cone_once, c): c["id"] for c in retry_batch}
+            future_map = {executor.submit(process_cone_once, c, lock): c["id"] for c in retry_batch}
             for future in tqdm(as_completed(future_map), total=len(future_map), desc="Phase 2"):
-                res = future.result()
-                if res["status"] == "SUCCESS":
-                    logger.info(f"Cone {res['id']} RECOVERED")
-                else:
-                    if res["attempts"] >= MAX_TOTAL_ATTEMPTS:
-                        res["status"] = "FAILED_FATAL"
-                    next_round.append(res)
+                try:
+                    res = future.result()
+                    if res["status"] == "SUCCESS":
+                        logger.info(f"Cone {res['id']} RECOVERED")
+                    else:
+                        if res["attempts"] >= MAX_TOTAL_ATTEMPTS:
+                            res["status"] = "FAILED_FATAL"
+                        next_round.append(res)
+                except Exception as e:
+                    logger.error(f"Worker crash: {e}")
 
         active = pending + next_round
 
@@ -242,20 +248,23 @@ def phase_two_parallel(failures):
 
 # --- Main Driver ---
 if __name__ == "__main__":
+    manager = Manager()
+    METRICS_LOCK = manager.Lock()
+
     start = time.perf_counter()
     print("Starting parallel two-phase cone processing pipeline...")
 
     cones = load_or_create_cones()
 
-    # Phase 1: process new cones only
-    new_cones = [c for c in cones if c["status"] in ("PENDING", "RETRY_LATER")]
-    failures = phase_one_parallel(new_cones)
+    # Phase 1: process new cones only (skip SUCCESS)
+    new_cones = [c for c in cones if c["status"] == "PENDING"]
+    failures = phase_one_parallel(new_cones, METRICS_LOCK)
 
     # Persist failures after Phase 1
     if failures:
         pd.DataFrame(failures).to_csv(FAILURE_LOG, index=False)
         # Phase 2: retry transient failures
-        final_failures = phase_two_parallel(failures)
+        final_failures = phase_two_parallel(failures, METRICS_LOCK)
         pd.DataFrame(final_failures).to_csv(FAILURE_LOG, index=False)
 
     runtime = time.perf_counter() - start
