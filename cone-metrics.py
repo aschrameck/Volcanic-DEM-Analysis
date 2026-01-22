@@ -210,15 +210,7 @@ def safe_div(numerator, denominator):
     return numerator / denominator
 
 
-def csv_writing(cone_dem, output_csv, base_name, warning, num, lat, lon,
-                cone_max_height,
-                cone_elev_stats, cone_perimeter, cone_area,
-                cone_width_stats,
-                cone_slope_stats, crater_max_depth,
-                crater_perimeter, crater_area, crater_width_stats,
-                crater_slope_stats, cone_elongation, cone_circularity,
-                cone_eccentricity, crater_elongation, crater_circularity,
-                crater_eccentricity, ratios):
+def csv_writing(lock, cone_dem, output_csv, base_name, data):
 
     """Writes metrics to a CSV file."""
 
@@ -233,8 +225,7 @@ def csv_writing(cone_dem, output_csv, base_name, warning, num, lat, lon,
     with open(csv_path, "a", newline="") as f:
         writer = csv.writer(f)
 
-        if new_file:
-            headers = [
+        headers = [
                 "Warnings", "Number", "Latitude", "Longitude",
                 "Cone_Height_Max", "Cone_Elev_Max", "Cone_Elev_Min", "Cone_Elev_Mean",
                 "Cone_Elev_Median", "Cone_Elev_Std", "Cone_Elev_Skew", "Cone_Elev_Kurt",
@@ -255,32 +246,10 @@ def csv_writing(cone_dem, output_csv, base_name, warning, num, lat, lon,
                 "CraterDepth/CraterAvgWidth", "ConeHeight/CraterAvgWidth",
                 "CraterAvgWidth/ConeAvgWidth", "CraterDepth/ConeHeight"
             ]
-            writer.writerow(headers)
-
-        writer.writerow([
-            warning, num, lat, lon,
-            cone_max_height,
-            cone_elev_stats["max"], cone_elev_stats["min"], cone_elev_stats["mean"],
-            cone_elev_stats["median"], cone_elev_stats["std"], cone_elev_stats["skew"],
-            cone_elev_stats["kurtosis"], cone_perimeter, cone_area,
-            cone_width_stats["max"], cone_width_stats["min"], cone_width_stats["mean"],
-            cone_width_stats["median"], cone_width_stats["std"], cone_width_stats["skew"],
-            cone_width_stats["kurtosis"], cone_slope_stats["max"], cone_slope_stats["min"],
-            cone_slope_stats["mean"], cone_slope_stats["median"], cone_slope_stats["std"],
-            cone_slope_stats["skew"], cone_slope_stats["kurtosis"], crater_max_depth,
-            crater_perimeter, crater_area, crater_width_stats["max"],
-            crater_width_stats["min"], crater_width_stats["mean"],
-            crater_width_stats["median"], crater_width_stats["std"],
-            crater_width_stats["skew"], crater_width_stats["kurtosis"],
-            crater_slope_stats["max"], crater_slope_stats["min"],
-            crater_slope_stats["mean"], crater_slope_stats["median"],
-            crater_slope_stats["std"], crater_slope_stats["skew"],
-            crater_slope_stats["kurtosis"], cone_elongation, cone_circularity,
-            cone_eccentricity, crater_elongation, crater_circularity,
-            crater_eccentricity, ratios["cone_h_avg_w"], ratios["cone_h_max_w"],
-            ratios["crater_d_avg_w"], ratios["cone_h_crater_avg_w"],
-            ratios["crater_avg_w_cone_avg_w"], ratios["crater_d_cone_h"]
-        ])
+        with lock:
+            if new_file:
+                writer.writerow(headers)
+            writer.writerow(data)
 
     return csv_path
 
@@ -466,31 +435,32 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
         crater_d_cone_h=safe_div(crater_max_depth, cone_max_height)
     )
 
-    if lock:
-        with lock:
-            csv_path = csv_writing(
-                cone_dem, output_csv, base_name, warning, num, lat, lon,
-                cone_max_height,
-                cone_elev_stats, cone_perimeter, cone_area,
-                cone_width_stats,
-                cone_slope_stats, crater_max_depth,
-                crater_perimeter, crater_area, crater_width_stats,
-                crater_slope_stats, cone_elongation, cone_circularity,
-                cone_eccentricity, crater_elongation, crater_circularity,
-                crater_eccentricity, ratios
-            )
-    else:
-        csv_path = csv_writing(
-            cone_dem, output_csv, base_name, warning, num, lat, lon,
-            cone_max_height,
-            cone_elev_stats, cone_perimeter, cone_area,
-            cone_width_stats,
-            cone_slope_stats, crater_max_depth,
-            crater_perimeter, crater_area, crater_width_stats,
-            crater_slope_stats, cone_elongation, cone_circularity,
-            cone_eccentricity, crater_elongation, crater_circularity,
-            crater_eccentricity, ratios
-        )
+    # --- Write to CSV ---
+    data = [
+        warning, num, lat, lon,
+        cone_max_height,
+        cone_elev_stats["max"], cone_elev_stats["min"], cone_elev_stats["mean"],
+        cone_elev_stats["median"], cone_elev_stats["std"], cone_elev_stats["skew"],
+        cone_elev_stats["kurtosis"], cone_perimeter, cone_area,
+        cone_width_stats["max"], cone_width_stats["min"], cone_width_stats["mean"],
+        cone_width_stats["median"], cone_width_stats["std"], cone_width_stats["skew"],
+        cone_width_stats["kurtosis"], cone_slope_stats["max"], cone_slope_stats["min"],
+        cone_slope_stats["mean"], cone_slope_stats["median"], cone_slope_stats["std"],
+        cone_slope_stats["skew"], cone_slope_stats["kurtosis"], crater_max_depth,
+        crater_perimeter, crater_area, crater_width_stats["max"],
+        crater_width_stats["min"], crater_width_stats["mean"],
+        crater_width_stats["median"], crater_width_stats["std"],
+        crater_width_stats["skew"], crater_width_stats["kurtosis"],
+        crater_slope_stats["max"], crater_slope_stats["min"],
+        crater_slope_stats["mean"], crater_slope_stats["median"],
+        crater_slope_stats["std"], crater_slope_stats["skew"],
+        crater_slope_stats["kurtosis"], cone_elongation, cone_circularity,
+        cone_eccentricity, crater_elongation, crater_circularity,
+        crater_eccentricity, ratios["cone_h_avg_w"], ratios["cone_h_max_w"],
+        ratios["crater_d_avg_w"], ratios["cone_h_crater_avg_w"],
+        ratios["crater_avg_w_cone_avg_w"], ratios["crater_d_cone_h"]]
+
+    csv_path = csv_writing(lock, cone_dem, output_csv, base_name, data)
 
     if diag:
         print(f"Runtime: {time.perf_counter() - start:.2f} sec")
