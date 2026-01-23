@@ -29,13 +29,13 @@ from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpac
 from measure import cone_metrics, CRS_Error
 
 # --- Configuration ---
-POLYGON_FOLDER = Path(r"D:\Polygons")
-DEM_FOLDER = Path(r"D:\DEMs")
-VENT_COORD = Path(r"D:\vent_coords.xls")
-CSV_OUT = Path(r"D:\metrics.csv")
+POLYGON_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\Polygons")
+DEM_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\DEMs")
+VENT_COORD = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_vent_coords.xls")
+CSV_OUT = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_metrics.csv")
 
-RUN_LOG = Path(r"D:\cone_run.log")
-FAILURE_LOG = Path(r"D:\cone_failures.csv")
+RUN_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_run.log")
+FAILURE_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_failures.csv")
 
 BASE_RETRY_DELAY = 30       # seconds
 MAX_RETRY_DELAY = 300       # seconds
@@ -193,57 +193,80 @@ def phase_one_parallel(cones, lock):
 
 # --- Phase 2 ---
 def phase_two_parallel(failures, lock):
-    """Retry transient failures in parallel until exhausted."""
+    """
+    Retry transient failures in parallel until exhausted.
+    """
     logger.info("PHASE 2 STARTED")
-    active = failures
 
-    while active:
+    # Things still eligible for retry
+    retry_queue = [c for c in failures if c["status"] == "RETRY_LATER"]
+
+    # Permanent failures (fatal or exhausted retries)
+    final_failures = [c for c in failures if c["status"] == "FAILED_FATAL"]
+
+    while retry_queue:
         now = datetime.now(timezone.utc)
 
-        retry_batch = [
-            c for c in active
-            if c["status"] == "RETRY_LATER"
-            and c["attempts"] < MAX_TOTAL_ATTEMPTS
+        # Find cones ready for retry
+        ready = [
+            c for c in retry_queue
+            if c["attempts"] < MAX_TOTAL_ATTEMPTS
             and datetime.fromisoformat(c["next_retry_after"]) <= now
         ]
 
-        pending = [c for c in active if c not in retry_batch]
+        waiting = [c for c in retry_queue if c not in ready]
 
-        if not retry_batch:
-            # Wait until the earliest next retry
-            future_times = [
+        if not ready:
+            # Sleep until the next retry time
+            next_times = [
                 datetime.fromisoformat(c["next_retry_after"])
-                for c in active if c["status"] == "RETRY_LATER"
+                for c in waiting
             ]
-            if future_times:
-                sleep_time = max(0, (min(future_times) - now).total_seconds())
-                logger.info(f"Sleeping {sleep_time:.1f}s until next retry")
-                time.sleep(sleep_time)
-            else:
+            if not next_times:
                 break
+
+            sleep_time = max(0, (min(next_times) - now).total_seconds())
+            logger.info(f"Sleeping {sleep_time:.1f}s until next retry")
+            time.sleep(sleep_time)
+            retry_queue = waiting
             continue
 
-        logger.info(f"Retrying {len(retry_batch)} cones")
+        logger.info(f"Retrying {len(ready)} cones")
 
-        next_round = []
+        next_retry_queue = []
+
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_map = {executor.submit(process_cone_once, c, lock): c["id"] for c in retry_batch}
-            for future in tqdm(as_completed(future_map), total=len(future_map), desc="Phase 2"):
+            futures = {
+                executor.submit(process_cone_once, c, lock): c["id"]
+                for c in ready
+            }
+
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 2"):
                 try:
                     res = future.result()
+
                     if res["status"] == "SUCCESS":
                         logger.info(f"Cone {res['id']} RECOVERED")
+
+                    elif res["attempts"] >= MAX_TOTAL_ATTEMPTS:
+                        res["status"] = "FAILED_FATAL"
+                        final_failures.append(res)
+                        logger.warning(
+                            f"Cone {res['id']} exhausted retries -> FAILED_FATAL"
+                        )
+
                     else:
-                        if res["attempts"] >= MAX_TOTAL_ATTEMPTS:
-                            res["status"] = "FAILED_FATAL"
-                        next_round.append(res)
+                        next_retry_queue.append(res)
+
                 except Exception as e:
                     logger.error(f"Worker crash: {e}")
 
-        active = pending + next_round
+        retry_queue = waiting + next_retry_queue
 
     logger.info("PHASE 2 COMPLETE")
-    return active
+
+    # Return everything that is not SUCCESS
+    return final_failures + retry_queue
 
 
 # --- Main Driver ---
