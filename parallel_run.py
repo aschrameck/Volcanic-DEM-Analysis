@@ -11,6 +11,7 @@ Features:
 6. Parallel processing using ProcessPoolExecutor.
 7. Centralized logging for full run.
 8. Progress bars using tqdm.
+9. Global download-error cooldown to avoid hammering API.
 """
 
 import time
@@ -29,14 +30,16 @@ from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpac
 from measure import cone_metrics, CRS_Error
 
 # --- Configuration ---
-POLYGON_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\Polygons")
-DEM_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\DEMs")
-VENT_COORD = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_vent_coords.xls")
-CSV_OUT = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_metrics.csv")
+# File paths
+POLYGON_FOLDER = Path(r"D:\Polygons")
+DEM_FOLDER = Path(r"D:\DEMs")
+VENT_COORD = Path(r"D:\vent_coords.xls")
+CSV_OUT = Path(r"D:\metrics.csv")
 
-RUN_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_run.log")
-FAILURE_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_failures.csv")
+RUN_LOG = Path(r"D:\cone_run.log")
+FAILURE_LOG = Path(r"D:\cone_failures.csv")
 
+# Retry configuration
 BASE_RETRY_DELAY = 30       # seconds
 MAX_RETRY_DELAY = 300       # seconds
 MAX_TOTAL_ATTEMPTS = 3      # maximum attempts per cone
@@ -46,6 +49,10 @@ MAX_WORKERS = max(1, os.cpu_count() - 3)  # leave 3 CPUs free
 # Error classification
 TRANSIENT_ERRORS = (DownloadError, Timeout, TimeoutError)
 FATAL_ERRORS = (NullError, DiskSpaceError, CRS_Error)
+
+# Download cooldown configuration
+DOWNLOAD_ERROR_THRESHOLD = 3   # consecutive DownloadErrors triggers cooldown
+COOLDOWN_SECONDS = 300          # cooldown duration in seconds
 
 # --- Logging ---
 logging.basicConfig(
@@ -86,11 +93,13 @@ def make_cone_record(id_, lat, lon) -> dict:
 
 def load_or_create_cones() -> list:
     """Load cones from Excel and optionally merge with existing failures."""
+    # Read in vent coordinates
     df = pd.read_excel(VENT_COORD)
     required = {"ID", "Latitude", "Longitude"}
     if not required.issubset(df.columns):
         raise ValueError(f"Excel must contain columns: {required}")
 
+    # Create initial cone records
     cones = [make_cone_record(r.ID, r.Latitude, r.Longitude) for r in df.itertuples()]
 
     # Merge previous failures
@@ -119,6 +128,7 @@ def process_cone_once(cone: dict, lock) -> dict:
     cone["attempts"] += 1
     cone["last_attempt"] = utc_now()
 
+    # Process the cone
     try:
         dem = dem_segment(
             cone["lat"], cone["lon"], cone["id"],
@@ -140,14 +150,18 @@ def process_cone_once(cone: dict, lock) -> dict:
             lock=lock
         )
 
+        # If it worked, set status to SUCCESS
         cone["status"] = "SUCCESS"
+        logger.info(f"Cone {cone['id']} SUCCESS")
         return cone
 
+    # Handle errors
     except FATAL_ERRORS as e:
         cone["status"] = "FAILED_FATAL"
         cone["error_type"] = type(e).__name__
         cone["error_msg"] = str(e)
         cone["traceback"] = traceback.format_exc()
+        logger.warning(f"Cone {cone['id']} -> {cone['status']} (reason: {cone['error_type']})")
         return cone
 
     except TRANSIENT_ERRORS as e:
@@ -155,12 +169,14 @@ def process_cone_once(cone: dict, lock) -> dict:
         cone["error_type"] = type(e).__name__
         cone["error_msg"] = str(e)
         cone["traceback"] = traceback.format_exc()
+        logger.warning(f"Cone {cone['id']} -> {cone['status']} (reason: {cone['error_type']})")
 
     except Exception as e:
         cone["status"] = "RETRY_LATER"
         cone["error_type"] = type(e).__name__
         cone["error_msg"] = str(e)
         cone["traceback"] = traceback.format_exc()
+        logger.warning(f"Cone {cone['id']} -> {cone['status']} (reason: {cone['error_type']})")
 
     cone["next_retry_after"] = (
         datetime.now(timezone.utc) + timedelta(seconds=compute_backoff(cone["attempts"]))
@@ -169,21 +185,55 @@ def process_cone_once(cone: dict, lock) -> dict:
 
 
 # --- Phase 1 ---
-def phase_one_parallel(cones, lock):
+def phase_one_parallel(cones, lock, dl_error_count, cooldown_until):
     """Process new cones in parallel."""
     logger.info("PHASE 1 STARTED")
     failures = []
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all cones for processing
         future_map = {executor.submit(process_cone_once, c, lock): c["id"] for c in cones}
+
+        # Collect results as they complete
         for future in tqdm(as_completed(future_map), total=len(future_map), desc="Phase 1"):
+            # Check global cooldown
+            now = time.time()
+            if cooldown_until.value > now:
+                sleep_time = cooldown_until.value - now
+                logger.warning(f"GLOBAL DOWNLOAD COOLDOWN ACTIVE ({sleep_time:.1f}s remaining)")
+                time.sleep(sleep_time)
+                logger.info("GLOBAL DOWNLOAD COOLDOWN ENDED")
+
+            # Process result
             try:
                 res = future.result()
+
+                # If successful, reset download error count
                 if res["status"] == "SUCCESS":
-                    logger.info(f"Cone {res['id']} SUCCESS")
-                else:
+                    dl_error_count.value = 0
+
+                # Handle DownloadError and track consecutive occurrences
+                elif res["error_type"] == "DownloadError":
+                    dl_error_count.value += 1
+                    logger.warning(f"Cone {res['id']} DownloadError (consecutive={dl_error_count.value})")
+
+                    # Trigger global cooldown if threshold exceeded
+                    if dl_error_count.value >= DOWNLOAD_ERROR_THRESHOLD:
+                        cooldown_until.value = time.time() + COOLDOWN_SECONDS
+                        logger.error(f"DOWNLOAD ERROR THRESHOLD HIT ({DOWNLOAD_ERROR_THRESHOLD})."
+                                     "Entering cooldown for {COOLDOWN_SECONDS}s")
+                        dl_error_count.value = 0
+
                     failures.append(res)
-                    logger.warning(f"Cone {res['id']} -> {res['status']} ({res['error_type']})")
+
+                # Handle other failures
+                elif res["status"] == "FAILED_FATAL":
+                    dl_error_count.value = 0
+                    failures.append(res)
+                else:
+                    dl_error_count.value = 0
+                    failures.append(res)
+
             except Exception as e:
                 logger.error(f"Worker crash: {e}")
 
@@ -192,7 +242,7 @@ def phase_one_parallel(cones, lock):
 
 
 # --- Phase 2 ---
-def phase_two_parallel(failures, lock):
+def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
     """
     Retry transient failures in parallel until exhausted.
     """
@@ -207,6 +257,13 @@ def phase_two_parallel(failures, lock):
     while retry_queue:
         now = datetime.now(timezone.utc)
 
+        # Global cooldown check
+        if cooldown_until.value > now:
+            sleep_time = cooldown_until.value - now
+            logger.warning(f"GLOBAL DOWNLOAD COOLDOWN ACTIVE ({sleep_time:.1f}s remaining)")
+            time.sleep(sleep_time)
+            logger.info("GLOBAL DOWNLOAD COOLDOWN ENDED")
+
         # Find cones ready for retry
         ready = [
             c for c in retry_queue
@@ -218,16 +275,14 @@ def phase_two_parallel(failures, lock):
 
         if not ready:
             # Sleep until the next retry time
-            next_times = [
-                datetime.fromisoformat(c["next_retry_after"])
-                for c in waiting
-            ]
-            if not next_times:
-                break
-
-            sleep_time = max(0, (min(next_times) - now).total_seconds())
-            logger.info(f"Sleeping {sleep_time:.1f}s until next retry")
-            time.sleep(sleep_time)
+            if waiting:
+                next_times = [
+                    datetime.fromisoformat(c["next_retry_after"]).timestamp()
+                    for c in waiting
+                ]
+                sleep_time = max(0, min(next_times) - time.time())
+                logger.info(f"Sleeping {sleep_time:.1f}s until next retry")
+                time.sleep(sleep_time)
             retry_queue = waiting
             continue
 
@@ -235,6 +290,7 @@ def phase_two_parallel(failures, lock):
 
         next_retry_queue = []
 
+        # Process ready cones in parallel
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
                 executor.submit(process_cone_once, c, lock): c["id"]
@@ -245,17 +301,37 @@ def phase_two_parallel(failures, lock):
                 try:
                     res = future.result()
 
+                    # If successful, reset download error count
                     if res["status"] == "SUCCESS":
                         logger.info(f"Cone {res['id']} RECOVERED")
+                        dl_error_count.value = 0
 
+                    # Handle DownloadError and track consecutive occurrences
+                    elif res["error_type"] == "DownloadError":
+                        dl_error_count.value += 1
+                        logger.warning(f"Cone {res['id']} DownloadError (consecutive={dl_error_count.value})")
+
+                        # Trigger global cooldown if threshold exceeded
+                        if dl_error_count.value >= DOWNLOAD_ERROR_THRESHOLD:
+                            cooldown_until.value = time.time() + COOLDOWN_SECONDS
+                            logger.error(f"DOWNLOAD ERROR THRESHOLD HIT ({DOWNLOAD_ERROR_THRESHOLD})."
+                                         "Entering cooldown for {COOLDOWN_SECONDS}s")
+                            dl_error_count.value = 0
+
+                        next_retry_queue.append(res)
+
+                    # If total attempts exhausted, mark as fatal
                     elif res["attempts"] >= MAX_TOTAL_ATTEMPTS:
                         res["status"] = "FAILED_FATAL"
                         final_failures.append(res)
                         logger.warning(
                             f"Cone {res['id']} exhausted retries -> FAILED_FATAL"
                         )
+                        dl_error_count.value = 0
 
+                    # Handle other failures
                     else:
+                        dl_error_count.value = 0
                         next_retry_queue.append(res)
 
                 except Exception as e:
@@ -271,9 +347,14 @@ def phase_two_parallel(failures, lock):
 
 # --- Main Driver ---
 if __name__ == "__main__":
+    # Set up multiprocessing shared variables
     manager = Manager()
     METRICS_LOCK = manager.Lock()
 
+    DOWNLOAD_ERROR_COUNT = manager.Value("i", 0)
+    COOLDOWN_UNTIL = manager.Value("d", 0.0)
+
+    # Begin processing pipeline
     start = time.perf_counter()
     print("Starting parallel two-phase cone processing pipeline...")
 
@@ -281,13 +362,14 @@ if __name__ == "__main__":
 
     # Phase 1: process new cones only (skip SUCCESS)
     new_cones = [c for c in cones if c["status"] == "PENDING"]
-    failures = phase_one_parallel(new_cones, METRICS_LOCK)
+    failures = phase_one_parallel(new_cones, METRICS_LOCK, DOWNLOAD_ERROR_COUNT, COOLDOWN_UNTIL)
 
     # Persist failures after Phase 1
     if failures:
         pd.DataFrame(failures).to_csv(FAILURE_LOG, index=False)
+
         # Phase 2: retry transient failures
-        final_failures = phase_two_parallel(failures, METRICS_LOCK)
+        final_failures = phase_two_parallel(failures, METRICS_LOCK, DOWNLOAD_ERROR_COUNT, COOLDOWN_UNTIL)
         pd.DataFrame(final_failures).to_csv(FAILURE_LOG, index=False)
 
     runtime = time.perf_counter() - start
