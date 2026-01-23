@@ -26,6 +26,8 @@ from measure import cone_metrics, CRS_Error
 
 
 # --- Configuration ---
+
+# File paths
 POLYGON_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\Polygons")
 DEM_FOLDER = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\DEMs")
 VENT_COORD = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_vent_coords.xls")
@@ -34,10 +36,12 @@ CSV_OUT = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\test_metrics.csv")
 RUN_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_run.log")
 FAILURE_LOG = Path(r"D:\NASA_Research_Project\Tests\Metrics Test\cone_failures.csv")
 
+# Retry configuration
 BASE_RETRY_DELAY = 30       # seconds
 MAX_RETRY_DELAY = 300       # seconds
 MAX_TOTAL_ATTEMPTS = 3      # maximum attempts per cone
 
+# Error classification
 TRANSIENT_ERRORS = (DownloadError, Timeout, TimeoutError)
 FATAL_ERRORS = (NullError, DiskSpaceError, CRS_Error)
 
@@ -60,10 +64,12 @@ def compute_backoff(attempts: int) -> int:
 
 
 def utc_now() -> str:
+    """Get current UTC time in ISO format."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def make_cone_record(id_, lat, lon) -> dict:
+    """Create initial cone record."""
     return {
         "id": id_,
         "lat": lat,
@@ -80,15 +86,13 @@ def make_cone_record(id_, lat, lon) -> dict:
 
 # --- Worker function ---
 def process_cone_once(cone: dict, lock) -> dict:
-    """
-    Process a cone exactly once.
-    Returns updated cone record.
-    """
+    """ Process a cone exactly once. Returns updated cone record. """
     print(f"Processing cone {cone['id']} (attempt {cone['attempts'] + 1})")
     cone = cone.copy()
     cone["attempts"] += 1
     cone["last_attempt"] = utc_now()
 
+    # Process the cone
     try:
         dem = dem_segment(
             cone["lat"], cone["lon"], cone["id"],
@@ -113,9 +117,11 @@ def process_cone_once(cone: dict, lock) -> dict:
             lock=lock
         )
 
+        # If it worked, set status to SUCCESS
         cone["status"] = "SUCCESS"
         return cone
 
+    # Handle errors
     except FATAL_ERRORS as e:
         cone["status"] = "FAILED_FATAL"
         cone["error_type"] = type(e).__name__
@@ -145,13 +151,16 @@ def process_cone_once(cone: dict, lock) -> dict:
 
 # --- Phase 1 ---
 def phase_one(cones, lock):
+    """Process all cones once without retries."""
     logger.info("PHASE 1 STARTED")
     print("PHASE 1 STARTED")
     failures = []
 
+    # Process each cone
     for cone in cones:
         res = process_cone_once(cone, lock)
 
+        # Log results
         if res["status"] == "SUCCESS":
             logger.info(f"Cone {res['id']} SUCCESS")
             print(f"Cone {res['id']} SUCCESS")
@@ -167,17 +176,23 @@ def phase_one(cones, lock):
 
 # --- Phase 2 ---
 def phase_two(failures, lock):
+    """Retry transient failures until exhausted."""
     logger.info("PHASE 2 STARTED")
     print("PHASE 2 STARTED")
 
+    # Things still eligible for retry
     active = [c for c in failures if c["status"] == "RETRY_LATER"]
+
+    # Permanent failures (fatal or exhausted retries)
     final_failures = [c for c in failures if c["status"] == "FAILED_FATAL"]
 
     while active:
         next_round = []
         now = datetime.now(timezone.utc)
 
+        # Process each active cone
         for cone in active:
+            # Check if max attempts reached or cooldown needed
             if cone["attempts"] >= MAX_TOTAL_ATTEMPTS:
                 cone["status"] = "FAILED_FATAL"
                 print(f"Cone {cone['id']} -> FAILED_FATAL (max attempts reached)")
@@ -195,6 +210,7 @@ def phase_two(failures, lock):
 
             res = process_cone_once(cone, lock)
 
+            # Log results
             if res["status"] == "SUCCESS":
                 logger.info(f"Cone {res['id']} RECOVERED")
             elif res["status"] == "FAILED_FATAL":
@@ -212,25 +228,31 @@ def phase_two(failures, lock):
 
 # --- Main Execution ---
 if __name__ == "__main__":
+    # Setup multiprocessing manager and lock
     manager = Manager()
     METRICS_LOCK = manager.Lock()
 
+    # Begin processing pipeline
     start = time.perf_counter()
     print("Starting two-phase cone processing pipeline...")
 
+    # Load vent coordinates
     df = pd.read_excel(VENT_COORD)
     cones = [
         make_cone_record(r.ID, r.Latitude, r.Longitude)
         for r in df.itertuples()
     ]
 
+    # Phase 1: process cones
     failures = phase_one(cones, METRICS_LOCK)
 
+    # Phase 2: retry transient failures
     if failures:
         pd.DataFrame(failures).to_csv(FAILURE_LOG, index=False)
         failures = phase_two(failures, METRICS_LOCK)
         pd.DataFrame(failures).to_csv(FAILURE_LOG, index=False)
 
+    # Final log
     runtime = time.perf_counter() - start
     logger.info(f"PIPELINE COMPLETE | Runtime {runtime:.2f}s")
     print(f"PIPELINE COMPLETE ({runtime:.2f}s)")
