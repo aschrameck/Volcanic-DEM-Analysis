@@ -157,8 +157,8 @@ def phase_one(cones, lock):
             print(f"Cone {res['id']} SUCCESS")
         else:
             failures.append(res)
-            logger.warning(f"Cone {res['id']} -> {res['status']}")
-            print(f"Cone {res['id']} -> {res['status']}")
+            logger.warning(f"Cone {res['id']} -> {res['status']} (reason: {res['error_type']})")
+            print(f"Cone {res['id']} -> {res['status']} (reason: {res['error_type']})")
 
     logger.info("PHASE 1 COMPLETE")
     print("PHASE 1 COMPLETE")
@@ -169,7 +169,9 @@ def phase_one(cones, lock):
 def phase_two(failures, lock):
     logger.info("PHASE 2 STARTED")
     print("PHASE 2 STARTED")
-    active = failures
+
+    active = [c for c in failures if c["status"] == "RETRY_LATER"]
+    final_failures = [c for c in failures if c["status"] == "FAILED_FATAL"]
 
     while active:
         next_round = []
@@ -178,12 +180,13 @@ def phase_two(failures, lock):
         for cone in active:
             if cone["attempts"] >= MAX_TOTAL_ATTEMPTS:
                 cone["status"] = "FAILED_FATAL"
-                next_round.append(cone)
+                print(f"Cone {cone['id']} -> FAILED_FATAL (max attempts reached)")
+                final_failures.append(cone)
                 continue
-
-            if now < datetime.fromisoformat(cone["next_retry_after"]):
-                next_round.append(cone)
-                continue
+            if cone["next_retry_after"] is not None:
+                if now < datetime.fromisoformat(cone["next_retry_after"]):
+                    next_round.append(cone)
+                    continue
 
             logger.info(
                 f"Retrying cone {cone['id']} "
@@ -192,17 +195,19 @@ def phase_two(failures, lock):
 
             res = process_cone_once(cone, lock)
 
-            if res["status"] != "SUCCESS":
-                next_round.append(res)
-            else:
+            if res["status"] == "SUCCESS":
                 logger.info(f"Cone {res['id']} RECOVERED")
-                print(f"Cone {res['id']} RECOVERED")
+            elif res["status"] == "FAILED_FATAL":
+                logger.error(f"Cone {res['id']} -> FAILED_FATAL (reason: {res['error_type']})")
+                final_failures.append(res)
+            else:
+                next_round.append(res)
 
         active = next_round
 
     logger.info("PHASE 2 COMPLETE")
     print("PHASE 2 COMPLETE")
-    return active
+    return final_failures
 
 
 # --- Main Execution ---
