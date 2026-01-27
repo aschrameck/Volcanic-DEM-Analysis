@@ -10,9 +10,10 @@ from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
 from scipy.stats import skew, kurtosis
 import matplotlib.pyplot as plt
+import traceback
 
 from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpaceError
-import traceback
+from basal_surface import basal_surface_from_dem, BasalSurfaceError
 
 
 # --- Custom Exceptions---
@@ -24,9 +25,16 @@ class CRS_Error(Exception):
 
 
 # --- Helper Functions ---
-def run_diagnostics(dem, transform, cone_poly, crater_poly,
-                    cone_centroid, crater_centroid, res_x, res_y,
-                    ray_length=40000):
+def run_diagnostics(
+    dem, transform,
+    cone_poly, crater_poly,
+    cone_centroid, crater_centroid,
+    cone_major_axis, cone_minor_axis, cone_orientation,
+    crater_major_axis, crater_minor_axis, crater_orientation,
+    relief, crater_fill,
+    res_x, res_y,
+    ray_length=40000
+):
     print("\n=== DIAGNOSTIC MODE ===\n")
 
     # 1. DEM properties
@@ -35,72 +43,149 @@ def run_diagnostics(dem, transform, cone_poly, crater_poly,
     if abs(res_x - res_y) > 1e-6:
         print("⚠ WARNING: Non-square pixels detected.")
 
-    # 2. Polygon visual check with proper scaling
-    plt.figure(figsize=(6, 6))
-
-    # DEM extent in map coordinates
+    # 2. DEM + polygons (correct georeferencing)
     height, width = dem.shape
     xmin = transform.c
     ymax = transform.f
     xmax = xmin + width * transform.a
-    ymin = ymax + height * transform.e  # note: e is usually negative
+    ymin = ymax + height * transform.e  # transform.e is negative
 
-    plt.imshow(dem, cmap="terrain", extent=[xmin, xmax, ymin, ymax], origin='upper')
-    plt.plot(*cone_poly.exterior.xy, 'r', label='Cone')
-    plt.plot(*crater_poly.exterior.xy, 'b', label='Crater')
-    plt.scatter([cone_centroid.x], [cone_centroid.y], c='yellow', label='Cone Centroid')
-    plt.scatter([crater_centroid.x], [crater_centroid.y], c='cyan', label='Crater Centroid')
-    plt.xlabel("X coordinate")
-    plt.ylabel("Y coordinate")
+    plt.figure(figsize=(6, 6))
+    plt.imshow(
+        dem,
+        cmap="terrain",
+        extent=[xmin, xmax, ymin, ymax],
+        origin="upper"
+    )
+    plt.plot(*cone_poly.exterior.xy, "r", lw=2, label="Cone")
+    plt.plot(*crater_poly.exterior.xy, "b", lw=2, label="Crater")
+    plt.scatter(cone_centroid.x, cone_centroid.y, c="yellow", s=30, label="Cone centroid")
+    plt.scatter(crater_centroid.x, crater_centroid.y, c="cyan", s=30, label="Crater centroid")
+    plt.xlabel("X")
+    plt.ylabel("Y")
     plt.title("DEM with Cone and Crater Polygons")
     plt.legend()
+    plt.gca().set_aspect("equal")
     plt.show()
 
-    # 3. Mask rasterization check
+    # 3. Mask rasterization sanity check
     out_shape = dem.shape
-    cone_mask = rasterize([(cone_poly, 1)], out_shape=out_shape, transform=transform).astype(bool)
-    crater_mask = rasterize([(crater_poly, 1)], out_shape=out_shape, transform=transform).astype(bool)
+    cone_mask = rasterize(
+        [(cone_poly, 1)],
+        out_shape=out_shape,
+        transform=transform,
+        fill=0,
+        dtype="uint8"
+    ).astype(bool)
+
+    crater_mask = rasterize(
+        [(crater_poly, 1)],
+        out_shape=out_shape,
+        transform=transform,
+        fill=0,
+        dtype="uint8"
+    ).astype(bool)
+
     plt.figure(figsize=(6, 6))
-    plt.imshow(dem, cmap='gray')
-    plt.imshow(cone_mask, alpha=0.4, cmap='Reds')
+    plt.imshow(dem, cmap="gray")
+    plt.imshow(cone_mask, alpha=0.4, cmap="Reds")
     plt.title("Cone Mask Check")
+    plt.axis("off")
     plt.show()
+
     plt.figure(figsize=(6, 6))
-    plt.imshow(dem, cmap='gray')
-    plt.imshow(crater_mask, alpha=0.4, cmap='Blues')
+    plt.imshow(dem, cmap="gray")
+    plt.imshow(crater_mask, alpha=0.4, cmap="Blues")
     plt.title("Crater Mask Check")
+    plt.axis("off")
     plt.show()
 
-    # 4. Radial width check at 0°
-    p1 = Point(cone_centroid.x - ray_length, cone_centroid.y)
-    p2 = Point(cone_centroid.x + ray_length, cone_centroid.y)
-    width_manual = cone_poly.intersection(LineString([p1, p2])).length
-    print("Manual width at 0°:", width_manual)
+    # 4. Manual width check (0° ray)
+    ray = LineString([
+        (cone_centroid.x - ray_length, cone_centroid.y),
+        (cone_centroid.x + ray_length, cone_centroid.y)
+    ])
+    inter = cone_poly.intersection(ray)
+    width_manual = inter.length if not inter.is_empty else np.nan
+    print(f"Manual width at 0°: {width_manual:.1f} m")
 
-    # 5. Slope validation at center
-    i, j = dem.shape[0]//2, dem.shape[1]//2
-    dzdx = (dem[i, j+1] - dem[i, j-1]) / (2*res_x)
-    dzdy = (dem[i+1, j] - dem[i-1, j]) / (2*res_y)
-    slope_manual = np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2)))
-    print("Manual slope at center:", slope_manual)
+    # 5. Slope validation (avoid edges)
+    i = dem.shape[0] // 2
+    j = dem.shape[1] // 2
+
+    if 1 <= i < dem.shape[0] - 1 and 1 <= j < dem.shape[1] - 1:
+        dzdx = (dem[i, j + 1] - dem[i, j - 1]) / (2 * res_x)
+        dzdy = (dem[i + 1, j] - dem[i - 1, j]) / (2 * res_y)
+        slope_manual = np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2)))
+        print(f"Manual slope (DEM center): {slope_manual:.2f}°")
 
     dy_arr, dx_arr = np.gradient(dem, res_y, res_x)
     slope_map = np.degrees(np.arctan(np.sqrt(dx_arr**2 + dy_arr**2)))
-    print("Slope from full map at center:", slope_map[i, j])
+    print(f"Slope from gradient map (center): {slope_map[i, j]:.2f}°")
 
-    # 6. Polar plot for widths
-    widths = []
+    # 6. Polar width distribution (cone)
+    widths = np.full(360, np.nan)
     for ang in range(360):
         t = np.radians(ang)
         dx = ray_length * np.cos(t)
         dy = ray_length * np.sin(t)
-        ray = LineString([(cone_centroid.x - dx, cone_centroid.y - dy),
-                          (cone_centroid.x + dx, cone_centroid.y + dy)])
+        ray = LineString([
+            (cone_centroid.x - dx, cone_centroid.y - dy),
+            (cone_centroid.x + dx, cone_centroid.y + dy)
+        ])
         inter = cone_poly.intersection(ray)
-        widths.append(inter.length if not inter.is_empty else np.nan)
+        if not inter.is_empty:
+            widths[ang] = inter.length
+
     plt.figure(figsize=(6, 6))
     plt.polar(np.radians(np.arange(360)), widths)
-    plt.title("Radial Widths (Cone)")
+    plt.title("Radial Cone Widths")
+    plt.show()
+
+    # 7. MVEE visualization (cone)
+    from matplotlib.patches import Ellipse
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.plot(*cone_poly.exterior.xy, "r", lw=2)
+    ax.add_patch(Ellipse(
+        xy=cone_centroid.coords[0],
+        width=cone_major_axis,
+        height=cone_minor_axis,
+        angle=cone_orientation,
+        edgecolor="blue",
+        facecolor="none",
+        lw=2
+    ))
+    ax.set_aspect("equal")
+    ax.set_title("Cone MVEE Fit")
+    ax.text(cone_centroid.x, cone_centroid.y,
+            f"{cone_orientation:.1f}°", color="blue")
+    plt.show()
+
+    # 8. MVEE visualization (crater)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.plot(*crater_poly.exterior.xy, "b", lw=2)
+    ax.add_patch(Ellipse(
+        xy=crater_centroid.coords[0],
+        width=crater_major_axis,
+        height=crater_minor_axis,
+        angle=crater_orientation,
+        edgecolor="green",
+        facecolor="none",
+        lw=2
+    ))
+    ax.set_aspect("equal")
+    ax.set_title("Crater MVEE Fit")
+    ax.text(crater_centroid.x, crater_centroid.y,
+            f"{crater_orientation:.1f}°", color="green")
+    plt.show()
+
+    # 9. Basal-corrected relief
+    plt.figure(figsize=(6, 6))
+    plt.imshow(relief, cmap="inferno")
+    plt.colorbar(label="Height above basal (m)")
+    plt.title("Basal-Corrected Cone Relief")
+    plt.axis("off")
     plt.show()
 
     print("Diagnostics complete.\n")
@@ -203,6 +288,69 @@ def radial_widths(polygon, centroid):
     return widths
 
 
+def fit_mvee(polygon, max_pts=500):
+    """
+    Fast, robust ellipse fit using PCA (covariance ellipse).
+
+    Returns:
+        major_axis (float)
+        minor_axis (float)
+        orientation_deg (float)  # degrees CCW from +X, [0, 180)
+
+    Notes:
+        - Ellipse represents 2sigma covariance ellipse
+        - Stable for elongated / fissure-like shapes
+        - Never iterates or inverts ill-conditioned matrices
+    """
+
+    # Extract boundary points
+    coords = np.asarray(polygon.exterior.coords[:-1])
+
+    if coords.shape[0] < 3:
+        return np.nan, np.nan, np.nan
+
+    # Downsample if needed
+    if coords.shape[0] > max_pts:
+        step = coords.shape[0] // max_pts
+        coords = coords[::step]
+
+    # Center the data
+    center = coords.mean(axis=0)
+    X = coords - center
+
+    # Degeneracy check (near-line features)
+    if np.linalg.matrix_rank(X) < 2:
+        return np.nan, np.nan, np.nan
+
+    # Covariance matrix
+    cov = np.cov(X, rowvar=False)
+
+    # Eigen decomposition
+    eigenvals, eigenvecs = np.linalg.eigh(cov)
+
+    # Sort largest → smallest
+    order = np.argsort(eigenvals)[::-1]
+    eigenvals = eigenvals[order]
+    eigenvecs = eigenvecs[:, order]
+
+    # Semi-axis lengths (2sigma ellipse)
+    # 2sigma ≈ captures ~95% of points for Gaussian shapes
+    major = 4 * np.sqrt(eigenvals[0])
+    minor = 4 * np.sqrt(eigenvals[1])
+
+    # Orientation
+    angle = np.degrees(np.arctan2(
+        eigenvecs[1, 0],
+        eigenvecs[0, 0]
+    )) % 180
+
+    # Final sanity check
+    if not np.isfinite(major) or not np.isfinite(minor):
+        return np.nan, np.nan, np.nan
+
+    return major, minor, angle
+
+
 def safe_div(numerator, denominator):
     """Safely divides two numbers, returning NaN if denominator is zero or NaN."""
     if denominator is None or np.isnan(denominator) or denominator == 0:
@@ -227,26 +375,33 @@ def csv_writing(lock, cone_dem, output_csv, base_name, data):
 
         headers = [
                 "Warnings", "Number", "Latitude", "Longitude",
-                "Cone_Height_Max", "Cone_Elev_Max", "Cone_Elev_Min", "Cone_Elev_Mean",
-                "Cone_Elev_Median", "Cone_Elev_Std", "Cone_Elev_Skew", "Cone_Elev_Kurt",
-                "Cone_Basal_Perimeter", "Cone_Basal_Area",
+                "Cone_Height_Max", "Cone_Volume", "Cone_Elev_Max", "Cone_Elev_Min",
+                "Cone_Elev_Mean", "Cone_Elev_Median", "Cone_Elev_Std", "Cone_Elev_Skew",
+                "Cone_Elev_Kurt", "Cone_Basal_Perimeter", "Cone_Basal_Area",
                 "Cone_Width_Max", "Cone_Width_Min", "Cone_Width_Mean", "Cone_Width_Median",
                 "Cone_Width_Std", "Cone_Width_Skew", "Cone_Width_Kurt",
                 "Cone_Slope_Max", "Cone_Slope_Min", "Cone_Slope_Mean", "Cone_Slope_Median",
                 "Cone_Slope_Std", "Cone_Slope_Skew", "Cone_Slope_Kurt",
-                "Crater_Depth_Max", "Crater_Basal_Perimeter", "Crater_Basal_Area",
-                "Crater_Width_Max", "Crater_Width_Min", "Crater_Width_Mean",
+                "Crater_Depth_Max", "Crater_Fill_Volume", "Crater_Basal_Perimeter",
+                "Crater_Basal_Area", "Crater_Width_Max", "Crater_Width_Min", "Crater_Width_Mean",
                 "Crater_Width_Median", "Crater_Width_Std", "Crater_Width_Skew",
                 "Crater_Width_Kurt", "Crater_Slope_Max", "Crater_Slope_Min",
                 "Crater_Slope_Mean", "Crater_Slope_Median", "Crater_Slope_Std",
                 "Crater_Slope_Skew", "Crater_Slope_Kurt",
                 "Cone_Elongation", "Cone_Circularity", "Cone_Eccentricity",
+                "Cone_Ellipse_MajorAxis", "Cone_Ellipse_MinorAxis", "Cone_Ellipse_Orientation",
                 "Crater_Elongation", "Crater_Circularity", "Crater_Eccentricity",
+                "Crater_Ellipse_MajorAxis", "Crater_Ellipse_MinorAxis", "Crater_Ellipse_Orientation",
                 "ConeHeight/ConeAvgWidth", "ConeHeight/ConeMaxWidth",
                 "CraterDepth/CraterAvgWidth", "ConeHeight/CraterAvgWidth",
                 "CraterAvgWidth/ConeAvgWidth", "CraterDepth/ConeHeight"
             ]
-        with lock:
+        if lock is not None:
+            with lock:
+                if new_file:
+                    writer.writerow(headers)
+                writer.writerow(data)
+        else:
             if new_file:
                 writer.writerow(headers)
             writer.writerow(data)
@@ -310,7 +465,7 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
     lon_str = str(lon).replace('.', '_')
     base_name = f"{num}_{lat_str}x{lon_str}"
 
-    # --- Load DEM and shapefiles ---
+    # Load DEM and shapefiles
     with rasterio.open(cone_dem) as src:
         dem = src.read(1)
         transform = src.transform
@@ -320,7 +475,7 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
     cone_gdf = gpd.read_file(cone_boundary)
     crater_gdf = gpd.read_file(crater_boundary)
 
-    # --- Reproject polygons to a projected CRS (meters) if DEM is geographic ---
+    # Reproject polygons to a projected CRS (meters) if DEM is geographic
     if dem_crs is None or dem_crs.is_geographic:  # degrees
         if diag:
             print("⚠ DEM is geographic (lat/lon). Reprojecting polygons to projected CRS in meters.")
@@ -330,7 +485,7 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
             "Reproject DEM to a projected CRS (meters) before computing metrics."
             )
 
-    # --- Ensure DEM and polygons CRS match ---
+    # Ensure DEM and polygons CRS match
     if cone_gdf.crs != dem_crs:
         cone_gdf = cone_gdf.to_crs(dem_crs)
     if crater_gdf.crs != dem_crs:
@@ -342,29 +497,12 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
     cone_centroid = cone_poly.centroid
     crater_centroid = crater_poly.centroid
 
-    # --- Now run diagnostics (all distances in meters) ---
-    if diag:
-        run_diagnostics(
-            dem=dem,
-            transform=transform,
-            cone_poly=cone_poly,
-            crater_poly=crater_poly,
-            cone_centroid=cone_centroid,
-            crater_centroid=crater_centroid,
-            res_x=res_x,
-            res_y=res_y
-        )
+    # Ellipse (MVEE) metrics
+    cone_major_axis, cone_minor_axis, cone_orientation = fit_mvee(cone_poly)
+    crater_major_axis, crater_minor_axis, crater_orientation = fit_mvee(crater_poly)
 
-    # Initialize warning string
-    warning = ""
-    if WARNING:
-        warning = "WARNING"
-        if warning_reasons:
-            warning += " (" + "; ".join(warning_reasons) + ")"
-
-    # Extract elevation values
+    # --- Extract raster values within polygons ---
     cone_elevs = raster_values_within_polygon(cone_dem, cone_poly)
-    crater_elevs = raster_values_within_polygon(cone_dem, crater_poly)
 
     # Compute slope values
     slope = slope_from_dem(cone_dem)
@@ -396,17 +534,60 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
     cone_widths = radial_widths(cone_poly, cone_centroid)
     crater_widths = radial_widths(crater_poly, crater_centroid)
 
-    # --- Compute metrics ---
+    # --- Basal surface correction ---
+    try:
+        basal_surface = basal_surface_from_dem(
+            dem=dem,
+            transform=transform,
+            cone_poly=cone_poly,
+            order=1  # planar, as in Hunt et al.
+        )
+        basal_surface[~cone_mask] = np.nan
+    except Exception as e:
+        raise BasalSurfaceError(f"Basal surface fitting failed: {e}")
 
+    # Height-above-basal DEM
+    relief = dem - basal_surface
+
+    # Mask invalid areas
+    relief[~cone_mask] = np.nan
+    rim_candidates = relief[cone_mask & ~crater_mask]
+
+    if np.nanstd(rim_candidates) > 0.5 * np.nanmean(rim_candidates):
+        warning_reasons.append("Crater rim elevation highly variable (possible breach)")
+
+    # --- Slope corrected metrics ---
+    # Cone max height
+    cone_max_height = np.nanmax(relief)
+
+    # Cone volume
+    pixel_area = abs(res_x * res_y)
+    cone_volume = np.nansum(np.clip(relief, 0, None) * pixel_area)
+
+    # Crater fill volume
+    rim_mask = cone_mask & ~crater_mask
+    rim_elev = np.nanpercentile(dem[rim_mask], 95)
+
+    crater_fill = rim_elev - relief
+    crater_fill[~crater_mask] = np.nan
+    crater_fill[crater_fill < 0] = 0
+
+    crater_fill_volume = np.nansum(crater_fill) * pixel_area
+
+    # --- Morphometrically computed metrics ---
     cone_elev_stats = describe_stats(cone_elevs)
-    crater_elev_stats = describe_stats(crater_elevs)
     cone_slope_stats = describe_stats(cone_slope_vals)
     crater_slope_stats = describe_stats(crater_slope_vals)
     cone_width_stats = describe_stats(cone_widths)
     crater_width_stats = describe_stats(crater_widths)
 
-    cone_max_height = cone_elev_stats["max"] - cone_elev_stats["min"]
-    crater_max_depth = crater_elev_stats["max"] - crater_elev_stats["min"]
+    # Crater depth
+    if np.count_nonzero(rim_mask) < 10:
+        warning_reasons.append("Insufficient rim pixels for reliable crater metrics")
+        crater_max_depth = np.nan
+    else:
+        crater_floor = np.nanmin(dem[crater_mask])
+        crater_max_depth = rim_elev - crater_floor
 
     # Area and perimeter
     cone_area = cone_poly.area
@@ -418,8 +599,8 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
     pi = np.pi
     cone_circularity = safe_div(4 * pi * cone_area, (cone_perimeter ** 2))
     crater_circularity = safe_div(4 * pi * crater_area, (crater_perimeter ** 2))
-    cone_elongation = safe_div(cone_area, (pi * (cone_width_stats["max"] / 2) ** 2))
-    crater_elongation = safe_div(crater_area, (pi * (crater_width_stats["max"] / 2) ** 2))
+    cone_elongation = safe_div(cone_minor_axis, cone_major_axis)
+    crater_elongation = safe_div(crater_minor_axis, crater_major_axis)
     cone_eccentricity = np.sqrt(1 - (safe_div(cone_width_stats["min"] ** 2, cone_width_stats["max"] ** 2)))
     crater_eccentricity = np.sqrt(1 - (safe_div(crater_width_stats["min"] ** 2, crater_width_stats["max"] ** 2)))
 
@@ -435,10 +616,39 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
         crater_d_cone_h=safe_div(crater_max_depth, cone_max_height)
     )
 
+    # --- Warnings ---
+    shape_mismatch = False
+
+    if np.isfinite(cone_minor_axis) and np.isfinite(crater_minor_axis):
+        log_axis_diff = abs(np.log(
+            (cone_minor_axis / cone_major_axis) /
+            (crater_minor_axis / crater_major_axis)
+        ))
+        shape_mismatch |= log_axis_diff > np.log(2)
+
+    if np.isfinite(cone_eccentricity) and np.isfinite(crater_eccentricity):
+        shape_mismatch |= abs(cone_eccentricity - crater_eccentricity) > 0.3
+
+    if shape_mismatch:
+        warning_reasons.append(
+            "Cone and crater shapes differ significantly (possible misidentification)"
+        )
+    if cone_circularity > 0.9:
+        warning_reasons.append("Cone shape is nearly circular (circularity > 0.9)")
+    if cone_elongation < 0.3:
+        warning_reasons.append("Highly elongated feature (likely fissure)")
+
+    # Initialize warning string
+    warning = ""
+    if WARNING:
+        warning = "WARNING"
+        if warning_reasons:
+            warning += " (" + "; ".join(warning_reasons) + ")"
+
     # --- Write to CSV ---
     data = [
         warning, num, lat, lon,
-        cone_max_height,
+        cone_max_height, cone_volume,
         cone_elev_stats["max"], cone_elev_stats["min"], cone_elev_stats["mean"],
         cone_elev_stats["median"], cone_elev_stats["std"], cone_elev_stats["skew"],
         cone_elev_stats["kurtosis"], cone_perimeter, cone_area,
@@ -447,7 +657,7 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
         cone_width_stats["kurtosis"], cone_slope_stats["max"], cone_slope_stats["min"],
         cone_slope_stats["mean"], cone_slope_stats["median"], cone_slope_stats["std"],
         cone_slope_stats["skew"], cone_slope_stats["kurtosis"], crater_max_depth,
-        crater_perimeter, crater_area, crater_width_stats["max"],
+        crater_fill_volume, crater_perimeter, crater_area, crater_width_stats["max"],
         crater_width_stats["min"], crater_width_stats["mean"],
         crater_width_stats["median"], crater_width_stats["std"],
         crater_width_stats["skew"], crater_width_stats["kurtosis"],
@@ -455,24 +665,45 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
         crater_slope_stats["mean"], crater_slope_stats["median"],
         crater_slope_stats["std"], crater_slope_stats["skew"],
         crater_slope_stats["kurtosis"], cone_elongation, cone_circularity,
-        cone_eccentricity, crater_elongation, crater_circularity,
-        crater_eccentricity, ratios["cone_h_avg_w"], ratios["cone_h_max_w"],
+        cone_eccentricity, cone_major_axis, cone_minor_axis, cone_orientation,
+        crater_elongation, crater_circularity, crater_eccentricity,
+        crater_major_axis, crater_minor_axis, crater_orientation,
+        ratios["cone_h_avg_w"], ratios["cone_h_max_w"],
         ratios["crater_d_avg_w"], ratios["cone_h_crater_avg_w"],
         ratios["crater_avg_w_cone_avg_w"], ratios["crater_d_cone_h"]]
 
     csv_path = csv_writing(lock, cone_dem, output_csv, base_name, data)
 
+    # --- Diagnostics ---
     if diag:
+        run_diagnostics(
+            dem=dem,
+            transform=transform,
+            cone_poly=cone_poly,
+            crater_poly=crater_poly,
+            cone_centroid=cone_centroid,
+            crater_centroid=crater_centroid,
+            cone_major_axis=cone_major_axis,
+            cone_minor_axis=cone_minor_axis,
+            cone_orientation=cone_orientation,
+            crater_major_axis=crater_major_axis,
+            crater_minor_axis=crater_minor_axis,
+            crater_orientation=crater_orientation,
+            relief=relief, crater_fill=crater_fill,
+            res_x=res_x, res_y=res_y
+        )
         print(f"Runtime: {time.perf_counter() - start:.2f} sec")
         print(f"Metrics saved to: {csv_path}")
 
     return csv_path
 
 
+# --- Test Cases ---
 if __name__ == "__main__":
+    start = time.perf_counter()
     polygon_folder = r"D:\Cone_Polygons"
     dem_folder = r"D:\Cone_DEMS"
-    csv_out = r"D:\tests.csv"
+    csv_out = r"D:\metrics.csv"
 
     print("Starting test cases for cone_metrics...\n")
 
@@ -503,12 +734,13 @@ if __name__ == "__main__":
                 WARNING=WARNING,
                 warning_reasons=warning_reasons,
                 output_csv=csv_out,
-                diag=False
+                diag=True
             )
 
-        except (NullError, DownloadError, DiskSpaceError) as e:
+        except (NullError, DownloadError, DiskSpaceError, BasalSurfaceError) as e:
             print(f"Expected error: {e}")
         except Exception:
             print(traceback.format_exc())
 
-    print("\nTest cases complete.")
+    end = time.perf_counter()
+    print(f"\nAll test cases completed in {end - start:.2f} seconds.")
