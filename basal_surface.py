@@ -2,27 +2,21 @@
 Basal surface reconstruction following Hunt et al. (2020)
 --------------------------------------------------------
 
-This module reconstructs the pre-eruptive (basal) surface of a volcanic cone
-using elevations sampled from a local ring *outside* the cone footprint.
+Reconstructs the pre-eruptive basal surface beneath a volcanic cone
+using elevations sampled from a ring surrounding the cone footprint.
 
-Conceptual basis:
-- Only terrain surrounding the cone represents pre-eruption topography
-- Interior cone/crater elevations are excluded
-- A low-order surface (planar by default) approximates the basal surface
-
-This approach is robust to breached cones and elongated geometries and avoids
-unconstrained interpolation across large interior voids.
-
-Intended usage:
-    basal = basal_surface_from_dem(dem, transform, cone_polygon)
-
-Dependencies: numpy, shapely
+Key properties:
+- Uses only exterior terrain (no cone/crater interior)
+- Rasterized sampling (fast, vectorized)
+- Robust to breached cones and elongate shapes
+- Safe handling of masked arrays and nodata
 """
 
 import numpy as np
-from shapely.geometry import Point
+from rasterio.features import rasterize
 
 
+# Custom exceptions
 class BasalSurfaceError(Exception):
     """Raised when basal surface reconstruction is ill-posed."""
     def __init__(self, message="Basal surface reconstruction error"):
@@ -30,98 +24,97 @@ class BasalSurfaceError(Exception):
         super().__init__(self.message)
 
 
-def _pixel_grid(dem, transform):
-    """Return map-coordinate grids X, Y for a DEM."""
+# --- Utility functions ---
+def sanitize_dem(dem):
+    """
+    Ensure DEM is a plain float ndarray with NaN nodata.
+    """
+    if np.ma.isMaskedArray(dem):
+        dem = dem.filled(np.nan)
+
+    dem = np.asarray(dem, dtype=float)
+    dem[~np.isfinite(dem)] = np.nan
+
+    return dem
+
+
+def pixel_grid(dem, transform):
+    """
+    Return map-coordinate grids X, Y for a DEM.
+    """
     rows, cols = dem.shape
     xs, ys = np.meshgrid(np.arange(cols), np.arange(rows))
+
     X = transform.c + xs * transform.a
     Y = transform.f + ys * transform.e
+
     return X, Y
 
 
-def sample_basal_ring(dem, transform, cone_poly, inner_buffer=0.0,
-                      outer_buffer=None, min_points=50):
+# --- Basal ring sampling ---
+def sample_basal_ring(
+    dem,
+    transform,
+    cone_poly,
+    inner_buffer=0.0,
+    outer_buffer=None,
+    min_points=50,
+):
     """
     Sample elevations from a ring surrounding the cone footprint.
-
-    Parameters
-    ----------
-    dem : 2D ndarray
-        DEM elevations
-    transform : affine.Affine
-        Raster transform
-    cone_poly : shapely Polygon
-        Cone basal footprint
-    inner_buffer : float, optional
-        Inner buffer distance (meters). Default 0.
-    outer_buffer : float, optional
-        Outer buffer distance (meters). If None, estimated from cone size.
-    min_points : int
-        Minimum required control points
-
-    Returns
-    -------
-    x, y, z : 1D ndarrays
-        Sampled basal control points
     """
-    # Estimate a reasonable outer buffer if not provided
+
+    # Sanitize DEM (critical)
+    dem = sanitize_dem(dem)
+
+    # Estimate outer buffer if not provided
     if outer_buffer is None:
-        # ~10–20% of equivalent cone diameter
         equiv_radius = np.sqrt(cone_poly.area / np.pi)
         outer_buffer = max(0.2 * equiv_radius, 50.0)
 
-    # Create basal sampling ring
+    # Build basal ring geometry
     inner = cone_poly.buffer(inner_buffer)
     outer = cone_poly.buffer(outer_buffer)
     ring = outer.difference(inner)
 
-    X, Y = _pixel_grid(dem, transform)
+    # Rasterize ring mask
+    mask = rasterize(
+        [(ring, 1)],
+        out_shape=dem.shape,
+        transform=transform,
+        fill=0,
+        dtype="uint8",
+    ).astype(bool)
 
-    mask = np.zeros(dem.shape, dtype=bool)
+    if not np.any(mask):
+        raise BasalSurfaceError("Basal ring rasterized to empty mask")
 
-    # Point-in-polygon test (explicit loop for robustness)
-    for i in range(dem.shape[0]):
-        for j in range(dem.shape[1]):
-            if not np.isfinite(dem[i, j]):
-                continue
-            if ring.contains(Point(X[i, j], Y[i, j])):
-                mask[i, j] = True
+    # Extract coordinates and elevations
+    X, Y = pixel_grid(dem, transform)
+    valid = mask & ~np.isnan(dem)
 
-    z = dem[mask]
-    x = X[mask]
-    y = Y[mask]
+    z = dem[valid]
+    x = X[valid]
+    y = Y[valid]
 
-    # Check for sufficient points
-    if len(z) < min_points:
+    if z.size < min_points:
         raise BasalSurfaceError(
-            f"Insufficient basal control points ({len(z)} found)"
+            f"Insufficient basal control points ({z.size} found)"
         )
 
     return x, y, z
 
 
+# --- Surface fitting ---
 def fit_basal_surface(x, y, z, order=1):
     """
     Fit a low-order surface to basal control points.
-
-    Parameters
-    ----------
-    x, y, z : 1D ndarrays
-        Control point coordinates
-    order : int
-        1 = planar surface
-        2 = quadratic surface
-
-    Returns
-    -------
-    coeffs : ndarray
-        Least-squares coefficients
     """
     if order == 1:
         A = np.column_stack([x, y, np.ones_like(x)])
     elif order == 2:
         A = np.column_stack([
-            x, y, x * y, x ** 2, y ** 2, np.ones_like(x)
+            x, y, x * y, x**2, y**2, np.ones_like(x)
         ])
     else:
         raise ValueError("Only order=1 or order=2 supported")
@@ -139,9 +132,17 @@ def evaluate_surface(coeffs, X, Y, order=1):
         return a * X + b * Y + c
     else:
         a, b, c, d, e, f = coeffs
-        return a * X + b * Y + c * X * Y + d * X ** 2 + e * Y ** 2 + f
+        return (
+            a * X +
+            b * Y +
+            c * X * Y +
+            d * X**2 +
+            e * Y**2 +
+            f
+        )
 
 
+# --- Main function ---
 def basal_surface_from_dem(
     dem,
     transform,
@@ -150,37 +151,30 @@ def basal_surface_from_dem(
     outer_buffer=None,
 ):
     """
-    Reconstruct basal surface beneath a volcanic cone following
-    Hunt et al. (2020).
-
-    Parameters
-    ----------
-    dem : 2D ndarray
-        Cone DEM
-    transform : affine.Affine
-        Raster transform
-    cone_poly : shapely Polygon
-        Cone footprint
-    order : int
-        Surface order (1 = planar, 2 = quadratic)
-    outer_buffer : float, optional
-        Basal control buffer distance (meters)
+    Reconstruct basal surface beneath a volcanic cone.
 
     Returns
     -------
     basal : 2D ndarray
         Reconstructed basal surface
     """
+
+    # Final DEM sanitation (belt-and-suspenders)
+    dem = sanitize_dem(dem)
+
+    # Sample basal control points
     x, y, z = sample_basal_ring(
-        dem,
-        transform,
-        cone_poly,
+        dem=dem,
+        transform=transform,
+        cone_poly=cone_poly,
         outer_buffer=outer_buffer,
     )
 
+    # Fit surface
     coeffs = fit_basal_surface(x, y, z, order=order)
 
-    X, Y = _pixel_grid(dem, transform)
-
+    # Evaluate over full grid
+    X, Y = pixel_grid(dem, transform)
     basal = evaluate_surface(coeffs, X, Y, order=order)
+
     return basal
