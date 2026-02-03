@@ -18,26 +18,27 @@ import time
 import traceback
 import logging
 import pandas as pd
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from requests.exceptions import Timeout
+from rasterio.errors import RasterioIOError
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import Manager
 from tqdm import tqdm
 import os
 
-from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpaceError
+from adaptive_dem_segment import dem_segment, NullError, DownloadError, DiskSpaceError, DEMSizeError
 from measure import cone_metrics, CRS_Error
+from basal_surface import BasalSurfaceError
 
 # --- Configuration ---
 # File paths
-POLYGON_FOLDER = Path(r"D:\Polygons")
-DEM_FOLDER = Path(r"D:\DEMs")
-VENT_COORD = Path(r"D:\vent_coords.xls")
-CSV_OUT = Path(r"D:\metrics.csv")
+POLYGON_FOLDER = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_Polygons")
+DEM_FOLDER = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_DEMS")
+VENT_COORD = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\test_vent_coords.xls")
+CSV_OUT = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_Metrics\Metrics_test.csv")
 
-RUN_LOG = Path(r"D:\cone_run.log")
-FAILURE_LOG = Path(r"D:\cone_failures.csv")
+RUN_LOG = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_Metrics\cone_run_test.log")
+FAILURE_LOG = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_Metrics\cone_failures_test.csv")
 
 # Retry configuration
 BASE_RETRY_DELAY = 30       # seconds
@@ -47,8 +48,8 @@ MAX_TOTAL_ATTEMPTS = 3      # maximum attempts per cone
 MAX_WORKERS = max(1, os.cpu_count() - 3)  # leave 3 CPUs free
 
 # Error classification
-TRANSIENT_ERRORS = (DownloadError, Timeout, TimeoutError)
-FATAL_ERRORS = (NullError, DiskSpaceError, CRS_Error)
+TRANSIENT_ERRORS = (DownloadError, Timeout, TimeoutError, RasterioIOError)
+FATAL_ERRORS = (NullError, DiskSpaceError, CRS_Error, BasalSurfaceError, DEMSizeError)
 
 # Download cooldown configuration
 DOWNLOAD_ERROR_THRESHOLD = 3   # consecutive DownloadErrors triggers cooldown
@@ -68,11 +69,6 @@ logger = logging.getLogger("cone_pipeline")
 def compute_backoff(attempts: int) -> int:
     """Compute exponential backoff (seconds) with cap."""
     return min(BASE_RETRY_DELAY * (2 ** (attempts - 1)), MAX_RETRY_DELAY)
-
-
-def utc_now() -> str:
-    """Return current UTC time as ISO string."""
-    return datetime.now(timezone.utc).isoformat()
 
 
 def make_cone_record(id_, lat, lon) -> dict:
@@ -126,7 +122,7 @@ def process_cone_once(cone: dict, lock) -> dict:
     """Process a single cone once and safely write metrics with lock."""
     cone = cone.copy()
     cone["attempts"] += 1
-    cone["last_attempt"] = utc_now()
+    cone["last_attempt"] = time.time()
 
     # Process the cone
     try:
@@ -179,8 +175,8 @@ def process_cone_once(cone: dict, lock) -> dict:
         logger.warning(f"Cone {cone['id']} -> {cone['status']} (reason: {cone['error_type']})")
 
     cone["next_retry_after"] = (
-        datetime.now(timezone.utc) + timedelta(seconds=compute_backoff(cone["attempts"]))
-    ).isoformat()
+        time.time() + compute_backoff(cone["attempts"])
+    )
     return cone
 
 
@@ -221,7 +217,7 @@ def phase_one_parallel(cones, lock, dl_error_count, cooldown_until):
                     if dl_error_count.value >= DOWNLOAD_ERROR_THRESHOLD:
                         cooldown_until.value = time.time() + COOLDOWN_SECONDS
                         logger.error(f"DOWNLOAD ERROR THRESHOLD HIT ({DOWNLOAD_ERROR_THRESHOLD})."
-                                     "Entering cooldown for {COOLDOWN_SECONDS}s")
+                                     f"Entering cooldown for {COOLDOWN_SECONDS}s")
                         dl_error_count.value = 0
 
                     failures.append(res)
@@ -255,7 +251,7 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
     final_failures = [c for c in failures if c["status"] == "FAILED_FATAL"]
 
     while retry_queue:
-        now = datetime.now(timezone.utc)
+        now = time.time()
 
         # Global cooldown check
         if cooldown_until.value > now:
@@ -268,7 +264,8 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
         ready = [
             c for c in retry_queue
             if c["attempts"] < MAX_TOTAL_ATTEMPTS
-            and datetime.fromisoformat(c["next_retry_after"]) <= now
+            and c["next_retry_after"] is not None
+            and c["next_retry_after"] <= now
         ]
 
         waiting = [c for c in retry_queue if c not in ready]
@@ -276,10 +273,7 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
         if not ready:
             # Sleep until the next retry time
             if waiting:
-                next_times = [
-                    datetime.fromisoformat(c["next_retry_after"]).timestamp()
-                    for c in waiting
-                ]
+                next_times = [c["next_retry_after"] for c in waiting if c["next_retry_after"]]
                 sleep_time = max(0, min(next_times) - time.time())
                 logger.info(f"Sleeping {sleep_time:.1f}s until next retry")
                 time.sleep(sleep_time)
@@ -315,7 +309,7 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
                         if dl_error_count.value >= DOWNLOAD_ERROR_THRESHOLD:
                             cooldown_until.value = time.time() + COOLDOWN_SECONDS
                             logger.error(f"DOWNLOAD ERROR THRESHOLD HIT ({DOWNLOAD_ERROR_THRESHOLD})."
-                                         "Entering cooldown for {COOLDOWN_SECONDS}s")
+                                         f"Entering cooldown for {COOLDOWN_SECONDS}s")
                             dl_error_count.value = 0
 
                         next_retry_queue.append(res)
