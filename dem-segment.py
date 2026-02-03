@@ -32,6 +32,11 @@ class DiskSpaceError(Exception):
         super().__init__(message)
 
 
+class DEMSizeError(Exception):
+    def __init__(self, message="DEM size exceeds maximum allowed dimensions."):
+        super().__init__(message)
+
+
 # --- Helper Functions ---
 def save_shapefile(geom, path, crs="EPSG:4326", extra_fields=None):
     """
@@ -61,6 +66,21 @@ def ensure_free_space(folder, required_bytes):
         raise DiskSpaceError(
             f"Not enough disk space (free: {gb_free:.2f} GB, required: {gb_req:.2f} GB)."
         )
+
+
+def validate_tile(tile_path):
+    """Quickly check if a raster is valid without rereading everything."""
+    try:
+        with rasterio.open(tile_path) as ds:
+            # Read only a 10x10 pixel corner
+            window = rasterio.windows.Window(0, 0, min(10, ds.width), min(10, ds.height))
+            ds.read(1, window=window, masked=True)
+    except Exception:
+        try:
+            os.remove(tile_path)
+        except Exception:
+            pass
+        raise DownloadError(f"Corrupted DEM tile: {os.path.basename(tile_path)}")
 
 
 # --- Main Function ---
@@ -171,24 +191,22 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             continue
 
         # Download new tiles
-        for i, item in enumerate(items[:]):
+        for i, item in enumerate(items):
             download_url = item.get("downloadURL")
-
             tile_name = os.path.basename(download_url).split("?")[0]
             tile_path = os.path.join(dem_folder, tile_name)
 
             try:
-                # First request: HEAD to get file size
+                # HEAD request to get file size
                 head = requests.head(download_url, timeout=30)
                 head.raise_for_status()
                 size_bytes = int(head.headers.get("Content-Length", "0"))
 
-                # Require at least 1.25× the expected file size (buffer for GeoTIFF overhead)
+                # Require at least 1.25× expected size (buffer for GeoTIFF)
                 required = int(size_bytes * 1.25) if size_bytes > 0 else 200 * 1024 * 1024
-
                 ensure_free_space(dem_folder, required)
 
-                # Second request: actual download
+                # GET request to download tile
                 with requests.get(download_url, stream=True, timeout=120) as resp:
                     resp.raise_for_status()
                     if diag:
@@ -198,25 +216,37 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                             if chunk:
                                 f.write(chunk)
 
+                # --- Optimized tile validation ---
+                try:
+                    with rasterio.open(tile_path) as ds:
+                        # Only read a small corner (10x10 pixels) to validate
+                        window = rasterio.windows.Window(0, 0, min(10, ds.width), min(10, ds.height))
+                        ds.read(1, window=window, masked=True)
+                except Exception:
+                    try:
+                        os.remove(tile_path)
+                    except Exception:
+                        pass
+                    raise DownloadError(f"Corrupted DEM tile: {tile_name}")
+
+                # Append to list of valid tiles
                 all_tiles.append(tile_path)
                 if diag:
-                    print(f"Downloaded: {tile_name}")
+                    print(f"Downloaded and validated: {tile_name}")
 
             except Exception as e:
-                # Delete temporary raster files
-                try:
-                    if raster_path and os.path.exists(raster_path):
-                        os.remove(raster_path)
-                except Exception as e:
-                    if diag:
-                        print(f"Warning: failed to delete temp raster: {e}")
-
+                # Clean up
                 for fp in all_tiles:
                     try:
                         if os.path.exists(fp):
                             os.remove(fp)
                     except Exception:
                         pass
+                try:
+                    if os.path.exists(tile_path):
+                        os.remove(tile_path)
+                except Exception:
+                    pass
 
                 stop_time = time.perf_counter()
                 if diag:
@@ -231,6 +261,7 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
         # --- Mosaic tiles together ---
         srcs = [rasterio.open(fp) for fp in all_tiles]
+
         mosaic, out_trans = merge(srcs)
 
         meta = srcs[0].meta.copy()
@@ -258,6 +289,12 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             cell_size = transform[0]
             nrows, ncols = dem_array.shape
             dem_crs = src.crs
+
+        # DEM size guard
+        if nrows * ncols > 5e8:   # ~4 GB float64
+            raise DEMSizeError(
+                f"DEM too large: {nrows}x{ncols} cells"
+            )
 
         transformer = Transformer.from_crs("EPSG:4326", dem_crs, always_xy=True)
 
@@ -514,12 +551,18 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
     # Only test if over a quarter of radials are short
     if len(short_group) >= 0.25*len(cone_arr):
-        # Welch's t-test
-        t_stat, p_val = ttest_ind(
-            short_group,
-            long_group,
-            equal_var=False,
-            alternative="less"  # test if short_group mean < long_group mean
+        # Perform Welch's t-test
+        if np.nanstd(short_group) < 1e-6 or np.nanstd(long_group) < 1e-6:
+            WARNING = True
+            warning_reasons.append(
+                "Radial lengths nearly identical; t-test unreliable"
+            )
+        else:
+            t_stat, p_val = ttest_ind(
+                short_group,
+                long_group,
+                equal_var=False,
+                alternative="less"
             )
 
         # Flag if difference is statistically significant
@@ -607,4 +650,3 @@ if __name__ == "__main__":
             print(f"Expected error: {e}")
         except Exception:
             print(traceback.format_exc())
-
