@@ -17,6 +17,7 @@ Features:
 import time
 import traceback
 import logging
+import requests
 import pandas as pd
 from pathlib import Path
 from requests.exceptions import Timeout
@@ -32,13 +33,13 @@ from basal_surface import BasalSurfaceError
 
 # --- Configuration ---
 # File paths
-POLYGON_FOLDER = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_Polygons")
-DEM_FOLDER = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_DEMS")
-VENT_COORD = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\test_vent_coords.xls")
-CSV_OUT = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_Metrics\Metrics_test.csv")
+POLYGON_FOLDER = Path(r"D:\Polygons")
+DEM_FOLDER = Path(r"D:\DEMs")
+VENT_COORD = Path(r"D:\Vent Coords.xls")
+CSV_OUT = Path(r"D:\Metrics.csv")
 
-RUN_LOG = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_Metrics\cone_run_test.log")
-FAILURE_LOG = Path(r"D:\NASA_Research_Project\San Franscisco Volcanic Field\Cone_Metrics\cone_failures_test.csv")
+RUN_LOG = Path(r"D:\cone_run.log")
+FAILURE_LOG = Path(r"D:\cone_failures.csv")
 
 # Retry configuration
 BASE_RETRY_DELAY = 30       # seconds
@@ -55,6 +56,11 @@ FATAL_ERRORS = (NullError, DiskSpaceError, CRS_Error, BasalSurfaceError, DEMSize
 DOWNLOAD_ERROR_THRESHOLD = 3   # consecutive DownloadErrors triggers cooldown
 COOLDOWN_SECONDS = 300          # cooldown duration in seconds
 
+# TNM Access API service health check
+UPTIMEROBOT_API_KEY = os.environ.get("UPTIMEROBOT_API_KEY")
+UPTIME_CHECK_INTERVAL = 120        # seconds between checks
+MAX_OUTAGE_WAIT = 900              # max total wait (15 min)
+
 # --- Logging ---
 logging.basicConfig(
     filename=RUN_LOG,
@@ -69,6 +75,64 @@ logger = logging.getLogger("cone_pipeline")
 def compute_backoff(attempts: int) -> int:
     """Compute exponential backoff (seconds) with cap."""
     return min(BASE_RETRY_DELAY * (2 ** (attempts - 1)), MAX_RETRY_DELAY)
+
+
+def external_services_up():
+    """Check if external services (e.g., TNM API) are up via UptimeRobot."""
+    url = "https://api.uptimerobot.com/v2/getMonitors"
+    payload = {
+        "api_key": UPTIMEROBOT_API_KEY,
+        "format": "json",
+        "logs": 0
+    }
+
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        monitors = data.get("monitors", [])
+        return all(m["status"] == 2 for m in monitors)  # 2 = UP
+
+    except Exception as e:
+        logger.warning(f"UptimeRobot check failed: {e}")
+        # Fail-open: do NOT block pipeline if status check breaks
+        return True
+
+
+def wait_for_services(outage_start, last_check):
+    """Wait if external services are down, with rate-limited checks."""
+    now = time.time()
+
+    # Rate-limit status checks
+    if now - last_check.value < UPTIME_CHECK_INTERVAL:
+        return
+
+    last_check.value = now
+
+    if external_services_up():
+        if outage_start.value > 0:
+            logger.info("External services recovered")
+        outage_start.value = 0
+        return
+
+    # Services are DOWN
+    if outage_start.value == 0:
+        outage_start.value = now
+        logger.error("External services DOWN — entering outage wait")
+
+    waited = now - outage_start.value
+    if waited >= MAX_OUTAGE_WAIT:
+        logger.critical(
+            f"External services down for {waited:.0f}s "
+            f"(max {MAX_OUTAGE_WAIT}s) — aborting run safely"
+        )
+        PIPELINE_ABORT.value = True
+        return
+
+    sleep_time = min(60, MAX_OUTAGE_WAIT - waited)
+    logger.warning(f"Services down — sleeping {sleep_time:.0f}s")
+    time.sleep(sleep_time)
 
 
 def make_cone_record(id_, lat, lon) -> dict:
@@ -124,8 +188,23 @@ def process_cone_once(cone: dict, lock) -> dict:
     cone["attempts"] += 1
     cone["last_attempt"] = time.time()
 
-    # Process the cone
     try:
+        # Check external services status
+        wait_for_services(
+            outage_start=OUTAGE_START,
+            last_check=LAST_UPTIME_CHECK,
+        )
+
+        # If a global outage was declared, exit safely
+        if PIPELINE_ABORT.value:
+            cone["status"] = "RETRY_OUTAGE"
+            cone["error_type"] = "ExternalServiceOutage"
+            cone["error_msg"] = "External services unavailable"
+            cone["traceback"] = None
+            cone["next_retry_after"] = None
+            return cone
+
+    # Process the cone
         dem = dem_segment(
             cone["lat"], cone["lon"], cone["id"],
             POLYGON_FOLDER, DEM_FOLDER, diag=False
@@ -192,6 +271,11 @@ def phase_one_parallel(cones, lock, dl_error_count, cooldown_until):
 
         # Collect results as they complete
         for future in tqdm(as_completed(future_map), total=len(future_map), desc="Phase 1"):
+            # Check for global abort
+            if PIPELINE_ABORT.value:
+                logger.critical("Abort flag set — stopping Phase 1 collection")
+                break
+
             # Check global cooldown
             now = time.time()
             if cooldown_until.value > now:
@@ -203,6 +287,12 @@ def phase_one_parallel(cones, lock, dl_error_count, cooldown_until):
             # Process result
             try:
                 res = future.result()
+
+                if res["error_type"] == "ExternalServiceOutage":
+                    failures.append(res)
+                    PIPELINE_ABORT.value = True
+                    logger.critical("Global outage detected — stopping Phase 1")
+                    break
 
                 # If successful, reset download error count
                 if res["status"] == "SUCCESS":
@@ -251,6 +341,11 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
     final_failures = [c for c in failures if c["status"] == "FAILED_FATAL"]
 
     while retry_queue:
+        # Check for global abort
+        if PIPELINE_ABORT.value:
+            logger.critical("Abort flag set — stopping Phase 2")
+            break
+
         now = time.time()
 
         # Global cooldown check
@@ -294,6 +389,12 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
             for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 2"):
                 try:
                     res = future.result()
+
+                    if res["error_type"] == "ExternalServiceOutage":
+                        failures.append(res)
+                        PIPELINE_ABORT.value = True
+                        logger.critical("Global outage detected — stopping Phase 2")
+                        break
 
                     # If successful, reset download error count
                     if res["status"] == "SUCCESS":
@@ -345,8 +446,14 @@ if __name__ == "__main__":
     manager = Manager()
     METRICS_LOCK = manager.Lock()
 
+    # Global download error tracking
     DOWNLOAD_ERROR_COUNT = manager.Value("i", 0)
     COOLDOWN_UNTIL = manager.Value("d", 0.0)
+
+    # TNM API Uptime monitoring
+    OUTAGE_START = manager.Value("d", 0.0)
+    LAST_UPTIME_CHECK = manager.Value("d", 0.0)
+    PIPELINE_ABORT = manager.Value("b", False)
 
     # Begin processing pipeline
     start = time.perf_counter()
@@ -356,15 +463,31 @@ if __name__ == "__main__":
 
     # Phase 1: process new cones only (skip SUCCESS)
     new_cones = [c for c in cones if c["status"] == "PENDING"]
-    failures = phase_one_parallel(new_cones, METRICS_LOCK, DOWNLOAD_ERROR_COUNT, COOLDOWN_UNTIL)
 
-    # Persist failures after Phase 1
+    failures = phase_one_parallel(
+        new_cones,
+        METRICS_LOCK,
+        DOWNLOAD_ERROR_COUNT,
+        COOLDOWN_UNTIL
+    )
+
     if failures:
+        # Save intermediate failures
         pd.DataFrame(failures).to_csv(FAILURE_LOG, index=False)
 
         # Phase 2: retry transient failures
-        final_failures = phase_two_parallel(failures, METRICS_LOCK, DOWNLOAD_ERROR_COUNT, COOLDOWN_UNTIL)
+        final_failures = phase_two_parallel(
+            failures,
+            METRICS_LOCK,
+            DOWNLOAD_ERROR_COUNT,
+            COOLDOWN_UNTIL
+        )
         pd.DataFrame(final_failures).to_csv(FAILURE_LOG, index=False)
+
+    if PIPELINE_ABORT.value:
+        logger.critical("Pipeline halted due to prolonged external outage")
+        print("Pipeline halted due to external outage. Safe to resume later.")
+        raise SystemExit(2)
 
     runtime = time.perf_counter() - start
     logger.info(f"PIPELINE COMPLETE | Runtime {runtime:.2f}s")
