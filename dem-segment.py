@@ -68,21 +68,6 @@ def ensure_free_space(folder, required_bytes):
         )
 
 
-def validate_tile(tile_path):
-    """Quickly check if a raster is valid without rereading everything."""
-    try:
-        with rasterio.open(tile_path) as ds:
-            # Read only a 10x10 pixel corner
-            window = rasterio.windows.Window(0, 0, min(10, ds.width), min(10, ds.height))
-            ds.read(1, window=window, masked=True)
-    except Exception:
-        try:
-            os.remove(tile_path)
-        except Exception:
-            pass
-        raise DownloadError(f"Corrupted DEM tile: {os.path.basename(tile_path)}")
-
-
 # --- Main Function ---
 def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
     """
@@ -565,12 +550,12 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                 alternative="less"
             )
 
-        # Flag if difference is statistically significant
-        if p_val < 0.05:
-            WARNING = True
-            warning_reasons.append(
-                f"Radial lengths are inconsistent (Welch t-test p={p_val:.3g})"
-            )
+            # Flag if difference is statistically significant
+            if p_val < 0.05:
+                WARNING = True
+                warning_reasons.append(
+                    f"Radial lengths are inconsistent (Welch t-test p={p_val:.3g})"
+                )
 
     # Elevation consistency check
     base_mean_elev = np.nanmean(base_elevations) if base_elevations else None
@@ -626,8 +611,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
 # --- Testing ---
 if __name__ == "__main__":
-    polygon_folder = r"D:\Cone_Polygons"
-    dem_folder = r"D:\Cone_DEMS"
+    polygon_folder = r"D:\NASA_Research_Project\Cone_Polygons"
+    dem_folder = r"D:\NASA_Research_Project\Cone_DEMS"
 
     test_cases = [
             {"lat": 35.597220, "lon": -111.610612, "num": 1},  # Crater 01 (very elongated crater, more like a fissure)
