@@ -10,8 +10,12 @@ import geopandas as gpd
 from scipy.stats import ttest_ind
 from rasterio.merge import merge
 from rasterio.mask import mask
+from rasterio.env import Env
 from pyproj import Transformer
 from shapely.geometry import Polygon, LineString, mapping
+
+# Silence GDAL chatter
+GDAL_ENV = Env(GDAL_DISABLE_READDIR_ON_OPEN="YES")
 
 
 # --- Custom Exceptions---
@@ -55,7 +59,7 @@ def ensure_free_space(folder, required_bytes):
     Raises DiskSpaceError if not enough space is available.
     """
     try:
-        usage = shutil.disk_usage(folder)
+        usage = shutil.disk_usage(os.path.abspath(folder))
         free = usage.free
     except Exception as e:
         raise DiskSpaceError(f"Unable to check free disk space: {e}")
@@ -97,6 +101,10 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
     os.makedirs(dem_folder, exist_ok=True)
     os.makedirs(polygon_folder, exist_ok=True)
 
+    # Initialize warning tracking
+    WARNING = False
+    warning_reasons = []
+
     # Safe filenames
     lat_str = str(lat).replace('.', '_')
     lon_str = str(lon).replace('.', '_')
@@ -114,6 +122,7 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
     all_tiles = []
     raster_path = None
     final_found = False
+    downloaded_this_run = set()
 
     # --- Outer Loop: Expand search area until found ---
     while current_radius <= max_radius and not final_found:
@@ -146,6 +155,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                 data = response.json()
             except Exception:
                 raise DownloadError("TNM did not return JSON.")
+        except DiskSpaceError:
+            raise
         except Exception as e:
             # Delete temporary raster files
             try:
@@ -181,6 +192,12 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             tile_name = os.path.basename(download_url).split("?")[0]
             tile_path = os.path.join(dem_folder, tile_name)
 
+            if os.path.exists(tile_path):
+                all_tiles.append(tile_path)
+                if diag:
+                    print(f"Using cached tile: {tile_name}")
+                continue
+
             try:
                 # HEAD request to get file size
                 head = requests.head(download_url, timeout=30)
@@ -203,40 +220,46 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
                 # --- Optimized tile validation ---
                 try:
-                    with rasterio.open(tile_path) as ds:
-                        # Only read a small corner (10x10 pixels) to validate
-                        window = rasterio.windows.Window(0, 0, min(10, ds.width), min(10, ds.height))
-                        ds.read(1, window=window, masked=True)
-                except Exception:
+                    with GDAL_ENV:
+                        with rasterio.open(tile_path) as ds:
+                            window = rasterio.windows.Window(
+                                0, 0, min(10, ds.width), min(10, ds.height)
+                            )
+                            ds.read(1, window=window, masked=True)
+
+                    # ONLY append if validation succeeded
+                    all_tiles.append(tile_path)
+                    downloaded_this_run.add(tile_path)
+                    if diag:
+                        print(f"Downloaded and validated: {tile_name}")
+
+                except Exception as e:
                     try:
-                        os.remove(tile_path)
+                        if os.path.exists(tile_path):
+                            os.remove(tile_path)
                     except Exception:
                         pass
-                    raise DownloadError(f"Corrupted DEM tile: {tile_name}")
 
-                # Append to list of valid tiles
-                all_tiles.append(tile_path)
-                if diag:
-                    print(f"Downloaded and validated: {tile_name}")
+                    WARNING = True
+                    warning_reasons.append(
+                        f"Tile skipped due to download/validation failure: {tile_name} ({e})"
+                    )
+
+                    if diag:
+                        print(f"Skipping tile {tile_name}: {e}")
+
+            except DiskSpaceError:
+                # Let disk space errors propagate cleanly
+                raise
 
             except Exception as e:
-                # Clean up
-                for fp in all_tiles:
+                if tile_path and os.path.exists(tile_path):
                     try:
-                        if os.path.exists(fp):
-                            os.remove(fp)
+                        os.remove(tile_path)
                     except Exception:
                         pass
-                try:
-                    if os.path.exists(tile_path):
-                        os.remove(tile_path)
-                except Exception:
-                    pass
 
-                stop_time = time.perf_counter()
-                if diag:
-                    print(f"Function finished in {stop_time - start_time:.1f} s")
-                raise DiskSpaceError(f"Failed to download tile {tile_name}: {e}")
+                raise DownloadError(f"Failed to download tile {tile_name}: {e}") from e
 
         if not all_tiles:
             stop_time = time.perf_counter()
@@ -245,11 +268,46 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             raise DownloadError("Failed to download DEM tiles.")
 
         # --- Mosaic tiles together ---
-        srcs = [rasterio.open(fp) for fp in all_tiles]
+        existing_tiles = [fp for fp in all_tiles if os.path.exists(fp)]
 
-        mosaic, out_trans = merge(srcs)
+        missing = set(all_tiles) - set(existing_tiles)
+        if missing:
+            if diag:
+                print(f"Warning: Missing tiles after download: {missing}")
+            warning_reasons.append(f"Missing tiles after download: {', '.join(os.path.basename(m) for m in missing)}")
+            WARNING = True
+
+        if not existing_tiles:
+            raise DownloadError("No valid DEM tiles found for this cone")
+
+        srcs = []
+        bad_tiles = []
+
+        for fp in existing_tiles:
+            try:
+                with GDAL_ENV:
+                    src = rasterio.open(fp)
+                    # force a tiny read to validate
+                    src.read(1, window=((0, 1), (0, 1)))
+                    srcs.append(src)
+            except Exception as e:
+                bad_tiles.append((fp, str(e)))
+                warning_reasons.append(f"Bad DEM tile skipped: {fp} ({e})")
+                WARNING = True
+
+        if not srcs:
+            raise DownloadError("All DEM tiles for cone are unreadable")
 
         meta = srcs[0].meta.copy()
+        try:
+            mosaic, out_trans = merge(srcs)
+        finally:
+            for s in srcs:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
         meta.update({
             "driver": "GTiff",
             "height": mosaic.shape[1],
@@ -260,25 +318,24 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
         raster_path = os.path.join(dem_folder, f"{base_name}_mosaic_{int(current_radius)}m.tif")
 
-        with rasterio.open(raster_path, "w", **meta) as dest:
-            dest.write(mosaic)
-
-        for s in srcs:
-            s.close()
+        with GDAL_ENV:
+            with rasterio.open(raster_path, "w", **meta) as dest:
+                dest.write(mosaic)
 
         # Read DEM
-        with rasterio.open(raster_path) as src:
-            dem_array = src.read(1).astype(float)
-            transform = src.transform
-            extent = src.bounds
-            cell_size = transform[0]
-            nrows, ncols = dem_array.shape
-            dem_crs = src.crs
+        with GDAL_ENV:
+            with rasterio.open(raster_path) as src:
+                dem_array = src.read(1).astype(float)
+                transform = src.transform
+                extent = src.bounds
+                cell_size = transform[0]
+                nrows, ncols = dem_array.shape
+                dem_crs = src.crs
 
         # DEM size guard
-        if nrows * ncols > 5e8:   # ~4 GB float64
+        if nrows * ncols * 8 > 6 * 1024**3:
             raise DEMSizeError(
-                f"DEM too large: {nrows}x{ncols} cells"
+                f"DEM too large: {nrows}x{ncols} cells (~{nrows*ncols*8/1024**3:.1f} GB)"
             )
 
         transformer = Transformer.from_crs("EPSG:4326", dem_crs, always_xy=True)
@@ -503,27 +560,25 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
     # Clip DEM to base polygon
     clipped_dem_path = os.path.join(dem_folder, f"{base_name}_DEM.tif")
 
-    with rasterio.open(raster_path) as src:
-        # Reproject polygon to match DEM CRS
-        base_poly_proj = gpd.GeoSeries([base_poly], crs="EPSG:4326").to_crs(src.crs).iloc[0]
-        out_image, out_transform = mask(src, [mapping(base_poly_proj)], crop=True)
+    with GDAL_ENV:
+        with rasterio.open(raster_path) as src:
+            # Reproject polygon to match DEM CRS
+            base_poly_proj = gpd.GeoSeries([base_poly], crs="EPSG:4326").to_crs(src.crs).iloc[0]
+            out_image, out_transform = mask(src, [mapping(base_poly_proj)], crop=True)
 
-        out_meta = src.meta.copy()
-        out_meta.update({
-            "driver": "GTiff",
-            "height": out_image.shape[1],
-            "width": out_image.shape[2],
-            "transform": out_transform,
-            "compress": "lzw"
-        })
+            out_meta = src.meta.copy()
+            out_meta.update({
+                "driver": "GTiff",
+                "height": out_image.shape[1],
+                "width": out_image.shape[2],
+                "transform": out_transform,
+                "compress": "lzw"
+            })
 
-        with rasterio.open(clipped_dem_path, "w", **out_meta) as dest:
-            dest.write(out_image)
+            with rasterio.open(clipped_dem_path, "w", **out_meta) as dest:
+                dest.write(out_image)
 
-        # --- Quality / Consistency Checks ---
-    WARNING = False
-    warning_reasons = []
-
+    # --- Quality / Consistency Checks ---
     # Radial length inconsistency check
     cone_arr = np.array(cone_edge_distances, dtype=float)
     cone_arr = cone_arr[~np.isnan(cone_arr)]
@@ -575,7 +630,7 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             print("  -", w)
 
     # Delete intermediate tiles
-    for tif in all_tiles:
+    for tif in downloaded_this_run:
         try:
             os.remove(tif)
         except Exception:
@@ -611,8 +666,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
 # --- Testing ---
 if __name__ == "__main__":
-    polygon_folder = r"D:\NASA_Research_Project\Cone_Polygons"
-    dem_folder = r"D:\NASA_Research_Project\Cone_DEMS"
+    polygon_folder = r"D:\Cone_Polygons"
+    dem_folder = r"D:\Cone_DEMS"
 
     test_cases = [
             {"lat": 35.597220, "lon": -111.610612, "num": 1},  # Crater 01 (very elongated crater, more like a fissure)
