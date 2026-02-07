@@ -56,11 +56,6 @@ FATAL_ERRORS = (NullError, DiskSpaceError, CRS_Error, BasalSurfaceError, DEMSize
 DOWNLOAD_ERROR_THRESHOLD = 3   # consecutive DownloadErrors triggers cooldown
 COOLDOWN_SECONDS = 300          # cooldown duration in seconds
 
-# TNM Access API service health check
-UPTIMEROBOT_API_KEY = os.environ.get("UPTIMEROBOT_API_KEY")
-UPTIME_CHECK_INTERVAL = 120        # seconds between checks
-MAX_OUTAGE_WAIT = 900              # max total wait (15 min)
-
 # --- Logging ---
 logging.basicConfig(
     filename=RUN_LOG,
@@ -69,6 +64,13 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger("cone_pipeline")
+
+# TNM Access API service health check
+UPTIMEROBOT_API_KEY = os.environ.get("UPTIMEROBOT_API_KEY")
+UPTIME_CHECK_INTERVAL = 120        # seconds between checks
+MAX_OUTAGE_WAIT = 900              # max total wait (15 min)
+if not UPTIMEROBOT_API_KEY:
+    logger.warning("No UPTIMEROBOT_API_KEY set — outage detection disabled")
 
 
 # --- Helper Functions ---
@@ -130,9 +132,8 @@ def wait_for_services(outage_start, last_check):
         PIPELINE_ABORT.value = True
         return
 
-    sleep_time = min(60, MAX_OUTAGE_WAIT - waited)
-    logger.warning(f"Services down — sleeping {sleep_time:.0f}s")
-    time.sleep(sleep_time)
+    logger.warning("Services down — deferring work to main loop")
+    return
 
 
 def make_cone_record(id_, lat, lon) -> dict:
@@ -182,7 +183,7 @@ def load_or_create_cones() -> list:
 
 
 # --- Worker Function ---
-def process_cone_once(cone: dict, lock) -> dict:
+def process_cone_once(cone, lock, outage_start, last_check, pipeline_abort) -> dict:
     """Process a single cone once and safely write metrics with lock."""
     cone = cone.copy()
     cone["attempts"] += 1
@@ -191,12 +192,12 @@ def process_cone_once(cone: dict, lock) -> dict:
     try:
         # Check external services status
         wait_for_services(
-            outage_start=OUTAGE_START,
-            last_check=LAST_UPTIME_CHECK,
+            outage_start=outage_start,
+            last_check=last_check,
         )
 
         # If a global outage was declared, exit safely
-        if PIPELINE_ABORT.value:
+        if pipeline_abort.value:
             cone["status"] = "RETRY_OUTAGE"
             cone["error_type"] = "ExternalServiceOutage"
             cone["error_msg"] = "External services unavailable"
@@ -267,7 +268,8 @@ def phase_one_parallel(cones, lock, dl_error_count, cooldown_until):
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit all cones for processing
-        future_map = {executor.submit(process_cone_once, c, lock): c["id"] for c in cones}
+        future_map = {executor.submit(process_cone_once, c, lock, OUTAGE_START, LAST_UPTIME_CHECK, PIPELINE_ABORT):
+                      c["id"] for c in cones}
 
         # Collect results as they complete
         for future in tqdm(as_completed(future_map), total=len(future_map), desc="Phase 1"):
@@ -363,15 +365,22 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
             and c["next_retry_after"] <= now
         ]
 
-        waiting = [c for c in retry_queue if c not in ready]
+        waiting = [c for c in retry_queue if (c not in ready and c["attempts"] < MAX_TOTAL_ATTEMPTS)]
 
         if not ready:
             # Sleep until the next retry time
             if waiting:
                 next_times = [c["next_retry_after"] for c in waiting if c["next_retry_after"]]
                 sleep_time = max(0, min(next_times) - time.time())
+                sleep_time = min(sleep_time, 60)  # cap sleep
+
                 logger.info(f"Sleeping {sleep_time:.1f}s until next retry")
-                time.sleep(sleep_time)
+
+                for _ in range(int(sleep_time)):
+                    if PIPELINE_ABORT.value:
+                        logger.critical("Abort detected during retry sleep")
+                        return final_failures + retry_queue
+                    time.sleep(1)
             retry_queue = waiting
             continue
 
@@ -382,9 +391,8 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
         # Process ready cones in parallel
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
-                executor.submit(process_cone_once, c, lock): c["id"]
-                for c in ready
-            }
+                executor.submit(process_cone_once, c, lock, OUTAGE_START, LAST_UPTIME_CHECK, PIPELINE_ABORT): c["id"]
+                for c in ready}
 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 2"):
                 try:
