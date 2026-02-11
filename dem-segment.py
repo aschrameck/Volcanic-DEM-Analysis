@@ -151,6 +151,10 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
         try:
             response = requests.get(url, params=params, timeout=60)
             response.raise_for_status()
+            if diag:
+                print("TNM status:", response.status_code)
+                print("TNM content-type:", response.headers.get("Content-Type"))
+                print(response.text[:300])
             try:
                 data = response.json()
             except Exception:
