@@ -35,7 +35,7 @@ from basal_surface import BasalSurfaceError
 # File paths
 POLYGON_FOLDER = Path(r"D:\Polygons")
 DEM_FOLDER = Path(r"D:\DEMs")
-VENT_COORD = Path(r"D:\Vent Coords.xls")
+VENT_COORD = Path(r"D:\vent_coords.xls")
 CSV_OUT = Path(r"D:\Metrics.csv")
 
 RUN_LOG = Path(r"D:\cone_run.log")
@@ -56,6 +56,7 @@ FATAL_ERRORS = (NullError, DiskSpaceError, CRS_Error, BasalSurfaceError, DEMSize
 DOWNLOAD_ERROR_THRESHOLD = 3   # consecutive DownloadErrors triggers cooldown
 COOLDOWN_SECONDS = 300          # cooldown duration in seconds
 
+
 # --- Logging ---
 logging.basicConfig(
     filename=RUN_LOG,
@@ -66,11 +67,8 @@ logging.basicConfig(
 logger = logging.getLogger("cone_pipeline")
 
 # TNM Access API service health check
-UPTIMEROBOT_API_KEY = os.environ.get("UPTIMEROBOT_API_KEY")
-UPTIME_CHECK_INTERVAL = 120        # seconds between checks
+CHECK_INTERVAL = 120        # seconds between checks
 MAX_OUTAGE_WAIT = 900              # max total wait (15 min)
-if not UPTIMEROBOT_API_KEY:
-    logger.warning("No UPTIMEROBOT_API_KEY set — outage detection disabled")
 
 
 # --- Helper Functions ---
@@ -79,40 +77,40 @@ def compute_backoff(attempts: int) -> int:
     return min(BASE_RETRY_DELAY * (2 ** (attempts - 1)), MAX_RETRY_DELAY)
 
 
-def external_services_up():
-    """Check if external services (e.g., TNM API) are up via UptimeRobot."""
-    url = "https://api.uptimerobot.com/v2/getMonitors"
-    payload = {
-        "api_key": UPTIMEROBOT_API_KEY,
-        "format": "json",
-        "logs": 0
+def tnm_health_check():
+    """Check if TNM Access API is responding correctly."""
+    url = "https://tnmaccess.nationalmap.gov/api/v1/products"
+    params = {
+        "bbox": "-111.6,35.5,-111.5,35.6",
+        "datasets": "National Elevation Dataset (NED) 1/3 arc-second",
+        "prodFormats": "GeoTIFF"
     }
 
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        r = requests.get(url, params=params, timeout=60)
 
-        monitors = data.get("monitors", [])
-        return all(m["status"] == 2 for m in monitors)  # 2 = UP
+        if r.status_code != 200:
+            return False
 
-    except Exception as e:
-        logger.warning(f"UptimeRobot check failed: {e}")
-        # Fail-open: do NOT block pipeline if status check breaks
+        # Check JSON is actually parseable
+        r.json()
         return True
 
+    except Exception:
+        return False
 
-def wait_for_services(outage_start, last_check):
+
+def wait_for_services(outage_start, last_check, pipeline_abort):
     """Wait if external services are down, with rate-limited checks."""
     now = time.time()
 
     # Rate-limit status checks
-    if now - last_check.value < UPTIME_CHECK_INTERVAL:
+    if now - last_check.value < CHECK_INTERVAL:
         return
 
     last_check.value = now
 
-    if external_services_up():
+    if tnm_health_check():
         if outage_start.value > 0:
             logger.info("External services recovered")
         outage_start.value = 0
@@ -129,7 +127,7 @@ def wait_for_services(outage_start, last_check):
             f"External services down for {waited:.0f}s "
             f"(max {MAX_OUTAGE_WAIT}s) — aborting run safely"
         )
-        PIPELINE_ABORT.value = True
+        pipeline_abort.value = True
         return
 
     logger.warning("Services down — deferring work to main loop")
@@ -194,6 +192,7 @@ def process_cone_once(cone, lock, outage_start, last_check, pipeline_abort) -> d
         wait_for_services(
             outage_start=outage_start,
             last_check=last_check,
+            pipeline_abort=pipeline_abort
         )
 
         # If a global outage was declared, exit safely
@@ -261,20 +260,20 @@ def process_cone_once(cone, lock, outage_start, last_check, pipeline_abort) -> d
 
 
 # --- Phase 1 ---
-def phase_one_parallel(cones, lock, dl_error_count, cooldown_until):
+def phase_one_parallel(cones, lock, dl_error_count, cooldown_until, pipeline_abort):
     """Process new cones in parallel."""
     logger.info("PHASE 1 STARTED")
     failures = []
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit all cones for processing
-        future_map = {executor.submit(process_cone_once, c, lock, OUTAGE_START, LAST_UPTIME_CHECK, PIPELINE_ABORT):
+        future_map = {executor.submit(process_cone_once, c, lock, OUTAGE_START, LAST_UPTIME_CHECK, pipeline_abort):
                       c["id"] for c in cones}
 
         # Collect results as they complete
         for future in tqdm(as_completed(future_map), total=len(future_map), desc="Phase 1"):
             # Check for global abort
-            if PIPELINE_ABORT.value:
+            if pipeline_abort.value:
                 logger.critical("Abort flag set — stopping Phase 1 collection")
                 break
 
@@ -292,7 +291,7 @@ def phase_one_parallel(cones, lock, dl_error_count, cooldown_until):
 
                 if res["error_type"] == "ExternalServiceOutage":
                     failures.append(res)
-                    PIPELINE_ABORT.value = True
+                    pipeline_abort.value = True
                     logger.critical("Global outage detected — stopping Phase 1")
                     break
 
@@ -330,7 +329,7 @@ def phase_one_parallel(cones, lock, dl_error_count, cooldown_until):
 
 
 # --- Phase 2 ---
-def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
+def phase_two_parallel(failures, lock, dl_error_count, cooldown_until, pipeline_abort):
     """
     Retry transient failures in parallel until exhausted.
     """
@@ -344,7 +343,7 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
 
     while retry_queue:
         # Check for global abort
-        if PIPELINE_ABORT.value:
+        if pipeline_abort.value:
             logger.critical("Abort flag set — stopping Phase 2")
             break
 
@@ -377,7 +376,7 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until):
                 logger.info(f"Sleeping {sleep_time:.1f}s until next retry")
 
                 for _ in range(int(sleep_time)):
-                    if PIPELINE_ABORT.value:
+                    if pipeline_abort.value:
                         logger.critical("Abort detected during retry sleep")
                         return final_failures + retry_queue
                     time.sleep(1)
@@ -476,7 +475,8 @@ if __name__ == "__main__":
         new_cones,
         METRICS_LOCK,
         DOWNLOAD_ERROR_COUNT,
-        COOLDOWN_UNTIL
+        COOLDOWN_UNTIL,
+        PIPELINE_ABORT
     )
 
     if failures:
@@ -488,7 +488,8 @@ if __name__ == "__main__":
             failures,
             METRICS_LOCK,
             DOWNLOAD_ERROR_COUNT,
-            COOLDOWN_UNTIL
+            COOLDOWN_UNTIL,
+            PIPELINE_ABORT
         )
         pd.DataFrame(final_failures).to_csv(FAILURE_LOG, index=False)
 
