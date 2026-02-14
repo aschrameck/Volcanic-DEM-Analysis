@@ -114,9 +114,9 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
         print(f"\nStarting DEM download for cone #{num}: ({lat}, {lon})")
 
     # Constants
-    initial_radius = 2000  # 2 km
-    max_radius = 400000  # 400 km
-    increment = 2000  # 2 km
+    initial_radius = 1000  # 1 km
+    max_radius = 10000  # 10 km
+    increment = 1000  # 1 km
     current_radius = initial_radius
 
     all_tiles = []
@@ -670,8 +670,8 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
 # --- Testing ---
 if __name__ == "__main__":
-    polygon_folder = r"D:\Cone_Polygons"
-    dem_folder = r"D:\Cone_DEMS"
+    polygon_folder = r"D:\Polygons"
+    dem_folder = r"D:\DEMs"
 
     test_cases = [
             {"lat": 35.597220, "lon": -111.610612, "num": 1},  # Crater 01 (very elongated crater, more like a fissure)
