@@ -35,8 +35,8 @@ from basal_surface import BasalSurfaceError
 # File paths
 POLYGON_FOLDER = Path(r"D:\Polygons")
 DEM_FOLDER = Path(r"D:\DEMs")
-VENT_COORD = Path(r"D:\vent_coords.xls")
-CSV_OUT = Path(r"D:\Metrics.csv")
+VENT_COORD = Path(r"D:\Vent Coords.xls")
+CSV_OUT = Path(r"D:\Run 6\Metrics.csv")
 
 RUN_LOG = Path(r"D:\cone_run.log")
 FAILURE_LOG = Path(r"D:\cone_failures.csv")
@@ -46,7 +46,7 @@ BASE_RETRY_DELAY = 30       # seconds
 MAX_RETRY_DELAY = 300       # seconds
 MAX_TOTAL_ATTEMPTS = 3      # maximum attempts per cone
 
-MAX_WORKERS = max(1, os.cpu_count() - 3)  # leave 3 CPUs free
+MAX_WORKERS = max(1, os.cpu_count() // 3)  # limit to avoid overloading API and local resources
 
 # Error classification
 TRANSIENT_ERRORS = (DownloadError, Timeout, TimeoutError, RasterioIOError)
@@ -100,40 +100,6 @@ def tnm_health_check():
         return False
 
 
-def wait_for_services(outage_start, last_check, pipeline_abort):
-    """Wait if external services are down, with rate-limited checks."""
-    now = time.time()
-
-    # Rate-limit status checks
-    if now - last_check.value < CHECK_INTERVAL:
-        return
-
-    last_check.value = now
-
-    if tnm_health_check():
-        if outage_start.value > 0:
-            logger.info("External services recovered")
-        outage_start.value = 0
-        return
-
-    # Services are DOWN
-    if outage_start.value == 0:
-        outage_start.value = now
-        logger.error("External services DOWN — entering outage wait")
-
-    waited = now - outage_start.value
-    if waited >= MAX_OUTAGE_WAIT:
-        logger.critical(
-            f"External services down for {waited:.0f}s "
-            f"(max {MAX_OUTAGE_WAIT}s) — aborting run safely"
-        )
-        pipeline_abort.value = True
-        return
-
-    logger.warning("Services down — deferring work to main loop")
-    return
-
-
 def make_cone_record(id_, lat, lon) -> dict:
     """Create canonical cone record dictionary."""
     return {
@@ -181,30 +147,14 @@ def load_or_create_cones() -> list:
 
 
 # --- Worker Function ---
-def process_cone_once(cone, lock, outage_start, last_check, pipeline_abort) -> dict:
+def process_cone_once(cone, lock) -> dict:
     """Process a single cone once and safely write metrics with lock."""
     cone = cone.copy()
     cone["attempts"] += 1
     cone["last_attempt"] = time.time()
 
     try:
-        # Check external services status
-        wait_for_services(
-            outage_start=outage_start,
-            last_check=last_check,
-            pipeline_abort=pipeline_abort
-        )
-
-        # If a global outage was declared, exit safely
-        if pipeline_abort.value:
-            cone["status"] = "RETRY_OUTAGE"
-            cone["error_type"] = "ExternalServiceOutage"
-            cone["error_msg"] = "External services unavailable"
-            cone["traceback"] = None
-            cone["next_retry_after"] = None
-            return cone
-
-    # Process the cone
+        # Process the cone
         dem = dem_segment(
             cone["lat"], cone["lon"], cone["id"],
             POLYGON_FOLDER, DEM_FOLDER, diag=False
@@ -267,7 +217,7 @@ def phase_one_parallel(cones, lock, dl_error_count, cooldown_until, pipeline_abo
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit all cones for processing
-        future_map = {executor.submit(process_cone_once, c, lock, OUTAGE_START, LAST_UPTIME_CHECK, pipeline_abort):
+        future_map = {executor.submit(process_cone_once, c, lock):
                       c["id"] for c in cones}
 
         # Collect results as they complete
@@ -342,11 +292,6 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until, pipeline_
     final_failures = [c for c in failures if c["status"] == "FAILED_FATAL"]
 
     while retry_queue:
-        # Check for global abort
-        if pipeline_abort.value:
-            logger.critical("Abort flag set — stopping Phase 2")
-            break
-
         now = time.time()
 
         # Global cooldown check
@@ -390,7 +335,7 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until, pipeline_
         # Process ready cones in parallel
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
-                executor.submit(process_cone_once, c, lock, OUTAGE_START, LAST_UPTIME_CHECK, PIPELINE_ABORT): c["id"]
+                executor.submit(process_cone_once, c, lock): c["id"]
                 for c in ready}
 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 2"):
@@ -399,7 +344,7 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until, pipeline_
 
                     if res["error_type"] == "ExternalServiceOutage":
                         failures.append(res)
-                        PIPELINE_ABORT.value = True
+                        pipeline_abort.value = True
                         logger.critical("Global outage detected — stopping Phase 2")
                         break
 
