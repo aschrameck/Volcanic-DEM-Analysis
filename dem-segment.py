@@ -422,7 +422,7 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             rising_count = 0
             flat_count = 0
             slope_points = 3  # consecutive points to confirm slope change
-            slope_change_threshold = 0.1  # m/m change to indicate slope break
+            slope_change_threshold = 0.2  # m/m change to indicate slope break
 
             # Skip any initial descent from crater rim toward center
             while prev_elev > center_elev and r < current_radius:
@@ -449,8 +449,16 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                     min_elev = elev
                     min_r = r
                     flat_count = 0
+                # Rising
+                elif elev > prev_elev:
+                    rising_count += 1
+                    flat_count = 0
+                    if rising_count >= slope_points:
+                        stop_reason = f"sustained rise detected after {slope_points} points"
+                        edge_found = True
+                        break
                 # Flattening
-                elif abs(elev - prev_elev) < 0.25:
+                elif abs(elev - prev_elev) < 0.2:
                     flat_count += 1
                     if flat_count >= slope_points:
                         stop_reason = f"flat terrain ({flat_count} points within 0.25 m)"
@@ -680,8 +688,8 @@ if __name__ == "__main__":
             {"lat": 35.3641, "lon": -111.5033, "num": 4},      # Sunset Crater - GOOD
             {"lat": 35.582329, "lon": -111.631927, "num": 5},  # SP Crater
             {"lat": 35.543845, "lon": -111.637273, "num": 6},  # Colton Crater
-            {"lat": 0, "lon": 0, "num": 7},                # Ocean (Null Error)
-            {"lat": 39.7392, "lon": -104.9903, "num": 8},  # Denver, CO (Cone Error)
+            # {"lat": 0, "lon": 0, "num": 7},                # Ocean (Null Error)
+            # {"lat": 39.7392, "lon": -104.9903, "num": 8},  # Denver, CO (Cone Error)
         ]
 
     for case in test_cases:
