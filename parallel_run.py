@@ -36,7 +36,7 @@ from basal_surface import BasalSurfaceError
 POLYGON_FOLDER = Path(r"D:\Polygons")
 DEM_FOLDER = Path(r"D:\DEMs")
 VENT_COORD = Path(r"D:\Vent Coords.xls")
-CSV_OUT = Path(r"D:\Run 6\Metrics.csv")
+CSV_OUT = Path(r"D:\Metrics.csv")
 
 RUN_LOG = Path(r"D:\cone_run.log")
 FAILURE_LOG = Path(r"D:\cone_failures.csv")
@@ -272,7 +272,22 @@ def phase_one_parallel(cones, lock, dl_error_count, cooldown_until, pipeline_abo
                     failures.append(res)
 
             except Exception as e:
-                logger.error(f"Worker crash: {e}")
+                cone_id = future_map[future]
+
+                logger.error(f"Cone {cone_id} WORKER CRASH: {e}")
+
+                failures.append({
+                    "id": cone_id,
+                    "lat": None,
+                    "lon": None,
+                    "status": "RETRY_LATER",
+                    "attempts": 1,
+                    "error_type": "WorkerCrash",
+                    "error_msg": str(e),
+                    "traceback": None,
+                    "last_attempt": time.time(),
+                    "next_retry_after": time.time() + BASE_RETRY_DELAY
+                })
 
     logger.info("PHASE 1 COMPLETE")
     return failures
@@ -382,7 +397,22 @@ def phase_two_parallel(failures, lock, dl_error_count, cooldown_until, pipeline_
                         next_retry_queue.append(res)
 
                 except Exception as e:
-                    logger.error(f"Worker crash: {e}")
+                    cone_id = futures[future]
+
+                    logger.error(f"Cone {cone_id} WORKER CRASH: {e}")
+
+                    failures.append({
+                        "id": cone_id,
+                        "lat": None,
+                        "lon": None,
+                        "status": "RETRY_LATER",
+                        "attempts": 1,
+                        "error_type": "WorkerCrash",
+                        "error_msg": str(e),
+                        "traceback": None,
+                        "last_attempt": time.time(),
+                        "next_retry_after": time.time() + BASE_RETRY_DELAY
+                    })
 
         retry_queue = waiting + next_retry_queue
 
@@ -448,3 +478,8 @@ if __name__ == "__main__":
     print(f"PIPELINE COMPLETE ({runtime:.2f}s)")
     print(f"Run log: {RUN_LOG}")
     print(f"Failure log: {FAILURE_LOG}")
+
+    # Number of cones processed in total
+    cone_count = len([c for c in cones if (c["status"] == "SUCCESS" or c["status"] == "FAILED_FATAL")])
+    logger.info(f"Total cones processed: {cone_count}/{len(cones)}")
+    print(f"Total cones processed: {cone_count}/{len(cones)}")
