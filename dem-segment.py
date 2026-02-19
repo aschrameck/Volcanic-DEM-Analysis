@@ -291,8 +291,7 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             try:
                 with GDAL_ENV:
                     src = rasterio.open(fp)
-                    # force a tiny read to validate
-                    src.read(1, window=((0, 1), (0, 1)))
+                    src.read(1)   # FULL READ to catch tile corruption
                     srcs.append(src)
             except Exception as e:
                 bad_tiles.append((fp, str(e)))
@@ -305,6 +304,13 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
         meta = srcs[0].meta.copy()
         try:
             mosaic, out_trans = merge(srcs)
+        except Exception as e:
+            for s in srcs:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            raise DownloadError(f"Merge failed: {e}")
         finally:
             for s in srcs:
                 try:
@@ -313,6 +319,7 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                     pass
 
         meta.update({
+            "nodata": np.nan,
             "driver": "GTiff",
             "height": mosaic.shape[1],
             "width": mosaic.shape[2],
@@ -329,7 +336,9 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
         # Read DEM
         with GDAL_ENV:
             with rasterio.open(raster_path) as src:
-                dem_array = src.read(1).astype(float)
+                dem_masked = src.read(1, masked=True)   # preserve nodata mask
+                dem_array = dem_masked.filled(np.nan).astype(np.float64)
+
                 transform = src.transform
                 extent = src.bounds
                 cell_size = transform[0]
@@ -360,13 +369,27 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                 return None if np.isnan(val) else float(val)
             return None
 
-        center_elev = get_elevation(lon, lat)
+        # --- Robust center elevation sampling ---
+        center_samples = []
+        sample_offsets_m = np.linspace(-cell_size, cell_size, 5)
 
-        if center_elev is None:
+        for dx in sample_offsets_m:
+            for dy in sample_offsets_m:
+                # convert meters to degrees
+                x_deg = lon + (dx / (111_000 * math.cos(lat)))
+                y_deg = lat + (dy / 111_000)
+                val = get_elevation(x_deg, y_deg)
+                if val is not None:
+                    center_samples.append(val)
+
+        if not center_samples:
             stop_time = time.perf_counter()
             if diag:
                 print(f"Function finished in {stop_time - start_time:.1f} s")
             raise NullError("Center elevation missing, invalid DEM.")
+
+        # use median for robustness
+        center_elev = float(np.median(center_samples))
 
         # Parameters
         radial_steps = 72
@@ -580,12 +603,14 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
             out_meta = src.meta.copy()
             out_meta.update({
+                "nodata": np.nan,
                 "driver": "GTiff",
                 "height": out_image.shape[1],
                 "width": out_image.shape[2],
                 "transform": out_transform,
                 "compress": "lzw"
             })
+            out_image = out_image.astype(np.float64)
 
             with rasterio.open(clipped_dem_path, "w", **out_meta) as dest:
                 dest.write(out_image)
