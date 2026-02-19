@@ -319,7 +319,6 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                     pass
 
         meta.update({
-            "nodata": np.nan,
             "driver": "GTiff",
             "height": mosaic.shape[1],
             "width": mosaic.shape[2],
