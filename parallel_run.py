@@ -478,8 +478,3 @@ if __name__ == "__main__":
     print(f"PIPELINE COMPLETE ({runtime:.2f}s)")
     print(f"Run log: {RUN_LOG}")
     print(f"Failure log: {FAILURE_LOG}")
-
-    # Number of cones processed in total
-    cone_count = len([c for c in cones if (c["status"] == "SUCCESS" or c["status"] == "FAILED_FATAL")])
-    logger.info(f"Total cones processed: {cone_count}/{len(cones)}")
-    print(f"Total cones processed: {cone_count}/{len(cones)}")
