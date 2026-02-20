@@ -370,12 +370,12 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
 
         # --- Robust center elevation sampling ---
         center_samples = []
-        sample_offsets_m = np.linspace(-cell_size, cell_size, 5)
+        sample_offsets_m = [0, 1, -1]  # meters offsets in x and y
 
         for dx in sample_offsets_m:
             for dy in sample_offsets_m:
                 # convert meters to degrees
-                x_deg = lon + (dx / (111_000 * math.cos(lat)))
+                x_deg = lon + (dx / (111_000 * math.cos(math.radians(lat))))
                 y_deg = lat + (dy / 111_000)
                 val = get_elevation(x_deg, y_deg)
                 if val is not None:
