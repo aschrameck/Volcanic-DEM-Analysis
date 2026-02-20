@@ -622,11 +622,11 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
     median_radius = np.median(cone_arr)
 
     # Define "short" radials relative to median
-    short_group = cone_arr[cone_arr < 0.6 * median_radius]
-    long_group = cone_arr[cone_arr >= 0.6 * median_radius]
+    short_group = cone_arr[cone_arr < 0.4 * median_radius]
+    long_group = cone_arr[cone_arr >= 0.4 * median_radius]
 
-    # Only test if over a quarter of radials are short
-    if len(short_group) >= 0.25*len(cone_arr):
+    # Only test if over a third of radials are short
+    if len(short_group) >= 0.33*len(cone_arr):
         # Perform Welch's t-test
         if np.nanstd(short_group) < 1e-6 or np.nanstd(long_group) < 1e-6:
             WARNING = True
@@ -642,7 +642,7 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
             )
 
             # Flag if difference is statistically significant
-            if p_val < 0.05:
+            if p_val < 0.1:
                 WARNING = True
                 warning_reasons.append(
                     f"Radial lengths are inconsistent (Welch t-test p={p_val:.3g})"
