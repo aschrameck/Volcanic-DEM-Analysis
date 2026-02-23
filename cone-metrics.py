@@ -26,7 +26,7 @@ class CRS_Error(Exception):
 
 # --- Helper Functions ---
 def run_diagnostics(
-    dem, transform,
+    dem, num, directory, transform,
     cone_poly, crater_poly,
     cone_centroid, crater_centroid,
     cone_major_axis, cone_minor_axis, cone_orientation,
@@ -36,6 +36,7 @@ def run_diagnostics(
     ray_length=40000
 ):
     print("\n=== DIAGNOSTIC MODE ===\n")
+    os.makedirs(directory, exist_ok=True)
 
     # 1. DEM properties
     print("DEM shape:", dem.shape)
@@ -63,10 +64,11 @@ def run_diagnostics(
     plt.scatter(crater_centroid.x, crater_centroid.y, c="cyan", s=30, label="Crater centroid")
     plt.xlabel("X")
     plt.ylabel("Y")
-    plt.title("DEM with Cone and Crater Polygons")
+    plt.title(f"Cone {num}: Cone and Crater Polygons")
     plt.legend()
     plt.gca().set_aspect("equal")
-    plt.show()
+    plt.savefig(os.path.join(directory, f"Cone_{num}_Polygon_Check.png"))
+    plt.close()
 
     # 3. Mask rasterization sanity check
     out_shape = dem.shape
@@ -89,16 +91,18 @@ def run_diagnostics(
     plt.figure(figsize=(6, 6))
     plt.imshow(dem, cmap="gray")
     plt.imshow(cone_mask, alpha=0.4, cmap="Reds")
-    plt.title("Cone Mask Check")
+    plt.title(f"Cone {num}: Cone Mask Check")
     plt.axis("off")
-    plt.show()
+    plt.savefig(os.path.join(directory, f"Cone_{num}_Cone_Mask_Check.png"))
+    plt.close()
 
     plt.figure(figsize=(6, 6))
     plt.imshow(dem, cmap="gray")
     plt.imshow(crater_mask, alpha=0.4, cmap="Blues")
-    plt.title("Crater Mask Check")
+    plt.title(f"Cone {num}: Crater Mask Check")
     plt.axis("off")
-    plt.show()
+    plt.savefig(os.path.join(directory, f"Cone_{num}_Crater_Mask_Check.png"))
+    plt.close()
 
     # 4. Manual width check (0° ray)
     ray = LineString([
@@ -139,8 +143,9 @@ def run_diagnostics(
 
     plt.figure(figsize=(6, 6))
     plt.polar(np.radians(np.arange(360)), widths)
-    plt.title("Radial Cone Widths")
-    plt.show()
+    plt.title(f"Cone {num}: Radial Widths")
+    plt.savefig(os.path.join(directory, f"Cone_{num}_Radial_Widths.png"))
+    plt.close()
 
     # 7. MVEE visualization (cone)
     from matplotlib.patches import Ellipse
@@ -157,10 +162,12 @@ def run_diagnostics(
         lw=2
     ))
     ax.set_aspect("equal")
-    ax.set_title("Cone MVEE Fit")
+    ax.set_title(f"Cone {num}: MVEE Fit")
     ax.text(cone_centroid.x, cone_centroid.y,
             f"{cone_orientation:.1f}°", color="blue")
-    plt.show()
+    # Save graph
+    plt.savefig(os.path.join(directory, f"Cone_{num}_MVEE_Fit.png"))
+    plt.close()
 
     # 8. MVEE visualization (crater)
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -175,26 +182,29 @@ def run_diagnostics(
         lw=2
     ))
     ax.set_aspect("equal")
-    ax.set_title("Crater MVEE Fit")
+    ax.set_title(f"Crater {num}: MVEE Fit")
     ax.text(crater_centroid.x, crater_centroid.y,
             f"{crater_orientation:.1f}°", color="green")
-    plt.show()
+    plt.savefig(os.path.join(directory, f"Crater_{num}_MVEE_Fit.png"))
+    plt.close()
 
     # 9. Basal-corrected relief
     plt.figure(figsize=(6, 6))
     plt.imshow(relief, cmap="inferno")
     plt.colorbar(label="Height above basal (m)")
-    plt.title("Basal-Corrected Cone Relief")
+    plt.title(f"Cone {num}: Basal-Corrected Relief")
     plt.axis("off")
-    plt.show()
+    plt.savefig(os.path.join(directory, f"Cone_{num}_Basal_Corrected_Relief.png"))
+    plt.close()
 
     # 10. Crater fill volume
     plt.figure(figsize=(6, 6))
     plt.imshow(crater_fill, cmap="Blues")
     plt.colorbar(label="Crater Fill Elevation (m)")
-    plt.title("Crater Fill Elevation")
+    plt.title(f"Crater {num}: Fill Elevation")
     plt.axis("off")
-    plt.show()
+    plt.savefig(os.path.join(directory, f"Crater_{num}_Fill_Elevation.png"))
+    plt.close()
 
     print("Diagnostics complete.\n")
 
@@ -692,6 +702,8 @@ def cone_metrics(lat, lon, num, cone_dem, cone_boundary, crater_boundary, WARNIN
     if diag:
         run_diagnostics(
             dem=dem,
+            num=num,
+            directory=os.path.dirname(csv_path),
             transform=transform,
             cone_poly=cone_poly,
             crater_poly=crater_poly,
