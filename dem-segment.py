@@ -368,27 +368,14 @@ def dem_segment(lat, lon, num, polygon_folder, dem_folder, diag=False):
                 return None if np.isnan(val) else float(val)
             return None
 
-        # --- Robust center elevation sampling ---
-        center_samples = []
-        sample_offsets_m = [0, 1, -1]  # meters offsets in x and y
+        # Center elevation sampling
+        center_elev = get_elevation(lon, lat)
 
-        for dx in sample_offsets_m:
-            for dy in sample_offsets_m:
-                # convert meters to degrees
-                x_deg = lon + (dx / (111_000 * math.cos(math.radians(lat))))
-                y_deg = lat + (dy / 111_000)
-                val = get_elevation(x_deg, y_deg)
-                if val is not None:
-                    center_samples.append(val)
-
-        if not center_samples:
+        if center_elev is None:
             stop_time = time.perf_counter()
             if diag:
                 print(f"Function finished in {stop_time - start_time:.1f} s")
             raise NullError("Center elevation missing, invalid DEM.")
-
-        # use median for robustness
-        center_elev = float(np.median(center_samples))
 
         # Parameters
         radial_steps = 72
