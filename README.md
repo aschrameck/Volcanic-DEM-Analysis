@@ -24,7 +24,7 @@ Volcanic-DEM-Analysis/
 |
 ├── DEMs/                    # Folder to store DEM downloads
 ├── Polygons/                # Folder to store cone and crater polygons
-├── data/                    # Sample segmented DEM files
+├── data/                    # Example cone segmenting and visualizations
 ├── output/                  # Output folder for metrics and logs
 ├── basal_surface.py         # Functions to interpolate the basal surface
 ├── cone-metrics.py          # Computes metrics from cone DEMs
