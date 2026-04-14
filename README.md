@@ -26,8 +26,6 @@ Volcanic-DEM-Analysis/
 ├── Polygons/                # Folder to store cone and crater polygons
 ├── data/                    # Example cone segmenting and visualizations
 ├── output/                  # Output folder for metrics and logs
-├── poster.pdf               # Research poster for project
-├── presentation.pptx        # Slideshow presentation for project
 ├── basal_surface.py         # Functions to interpolate the basal surface
 ├── cone-metrics.py          # Computes metrics from cone DEMs
 ├── dem-segment.py           # Core DEM segmentation functions
@@ -35,6 +33,8 @@ Volcanic-DEM-Analysis/
 ├── radial-segment.py        # OBSOLETE - Radial segmentation for base and crater boundaries
 ├── run.py                   # Serial (single-threaded) pipeline
 ├── vent_coords.xls          # Example vent coordinate input
+├── poster.pdf               # Research poster for project
+├── presentation.pptx        # Slideshow presentation for project
 ├── README.md
 ```
 
